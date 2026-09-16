@@ -1,0 +1,38 @@
+# Stack de PRODUÇÃO do serviço `backend-engine` — mesma imagem que vai para a
+# nuvem, para validar antes do deploy ou rodar num VPS.
+#
+# Assim como em dev, a infra pertence ao repositório do serviço backend: aqui
+# só entramos na rede que o compose de produção dele publica
+# (`aureon_net_prod`). Suba aquele primeiro.
+#
+#   docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+#
+# DATABASE_URL e RABBITMQ_URL vêm do .env.prod e já apontam para os hosts
+# `postgres`/`rabbitmq` dessa rede — não são sobrescritas aqui, justamente
+# para que este arquivo sirva igual num VPS onde a infra seja externa
+# (Postgres gerenciado, CloudAMQP): basta trocar as duas URLs no .env.prod.
+
+name: aureon-engine-prod
+
+services:
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    env_file:
+      - .env.prod
+    environment:
+      NODE_ENV: production
+    networks: [aureon]
+    # NÃO roda migrations: o schema tem uma única fonte de verdade, o serviço
+    # backend. Ver prisma/README.md.
+    deploy:
+      # O poller de timeout de espera roda dentro do processo. Antes de subir
+      # este número, confirme que o claim de nós é atômico — ver DEPLOY.md.
+      replicas: 1
+
+networks:
+  aureon:
+    name: aureon_net_prod
+    external: true

@@ -1,0 +1,41 @@
+# Contexto de build deste serviço — a raiz deste repositório.
+#
+# Sem estes filtros, cada deploy sobe node_modules/ e dist/ do host para o
+# builder: centenas de MB por push, e artefatos compilados no host podem
+# sobrescrever os que a imagem acabou de compilar em Linux.
+
+# --- Dependências e artefatos de build (sempre reconstruídos na imagem) ---
+node_modules
+dist
+coverage
+*.tsbuildinfo
+
+# --- Secrets: NUNCA em layer de imagem ---
+.env
+.env.*
+!.env.example
+
+# --- Testes e ferramentas de dev ---
+**/*.spec.ts
+**/*.e2e-spec.ts
+
+# --- Git e metadados ---
+.git
+.gitignore
+.github/
+.claude/
+
+# --- Editor / SO ---
+.vscode/
+.idea/
+**/.DS_Store
+**/Thumbs.db
+
+# --- Docs e compose (não são insumo de build) ---
+**/*.md
+docker-compose*.yml
+
+# Dockerfile e .dockerignore NÃO entram nesta lista de propósito: a Railway
+# aplica estes filtros ao montar o snapshot do build ANTES de localizar o
+# Dockerfile, e um Dockerfile filtrado vira "Dockerfile does not exist" no
+# meio do deploy.

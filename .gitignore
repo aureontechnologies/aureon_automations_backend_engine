@@ -1,0 +1,17 @@
+# Secrets — só o .env.example é versionado
+.env
+.env.*
+!.env.example
+
+# Dependências e artefatos de build
+node_modules/
+dist/
+dist-seed/
+coverage/
+*.tsbuildinfo
+
+# Editor / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

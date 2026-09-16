@@ -1,0 +1,607 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Auth / Tenancy
+// ---------------------------------------------------------------------------
+
+model Tenant {
+  id       String   @id @default(uuid()) @db.Uuid
+  nome     String
+  criadoEm DateTime @default(now()) @db.Timestamptz()
+
+  usuarios               Usuario[]
+  whatsappConnections    WhatsAppConnection[]
+  contatos               Contato[]
+  workflows              Workflow[]
+  webhookEvents          ChannelWebhookEvent[]
+  agentes                Agente[]
+  metaChannelConnections MetaChannelConnection[]
+  customWebhooks         CustomWebhook[]
+  mensagens              Mensagem[]
+
+  @@map("tenants")
+}
+
+model Usuario {
+  id        String   @id @default(uuid()) @db.Uuid
+  nome      String
+  email     String   @unique
+  senhaHash String
+  tenantId  String   @db.Uuid
+  criadoEm  DateTime @default(now()) @db.Timestamptz()
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  refreshTokens RefreshToken[]
+
+  @@index([tenantId])
+  @@map("usuarios")
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  usuarioId  String    @db.Uuid
+  tokenHash  String
+  expiraEm   DateTime  @db.Timestamptz()
+  revogadoEm DateTime? @db.Timestamptz()
+  criadoEm   DateTime  @default(now()) @db.Timestamptz()
+
+  usuario Usuario @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  @@unique([tokenHash])
+  @@index([usuarioId])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// WhatsApp / Meta connection
+// ---------------------------------------------------------------------------
+
+enum WhatsAppConnectionStatus {
+  PENDENTE
+  CONECTADO
+  EXPIRADO
+  ERRO
+
+  @@map("whatsapp_connection_status")
+}
+
+model WhatsAppConnection {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+
+  wabaId             String
+  phoneNumberId      String
+  businessId         String?
+  displayPhoneNumber String?
+  verifiedName       String?
+
+  /// Envelope AES-256-GCM serializado como "v1.<iv_b64>.<authTag_b64>.<ciphertext_b64>".
+  /// Nunca decodificar/logar este campo fora do TokenCryptoService.
+  accessTokenEncrypted String
+
+  status       WhatsAppConnectionStatus @default(PENDENTE)
+  conectadoEm  DateTime?                @db.Timestamptz()
+  criadoEm     DateTime                 @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime                 @updatedAt @db.Timestamptz()
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversas Conversa[]
+
+  /// phoneNumberId da Meta é globalmente único — impede que um número
+  /// migrado entre tenants sem limpeza cause roteamento cruzado de webhooks.
+  @@unique([phoneNumberId])
+  /// Um tenant pode conectar vários números de WhatsApp Business — cada
+  /// automação escolhe a qual número seu gatilho responde.
+  @@index([tenantId])
+  @@map("whatsapp_connections")
+}
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSED
+  IGNORED
+  ERROR
+
+  @@map("webhook_event_status")
+}
+
+model ChannelWebhookEvent {
+  id              String             @id @default(uuid()) @db.Uuid
+  tenantId        String?            @db.Uuid
+  provider        String             @default("meta")
+  /// Hash SHA-256 do corpo bruto do webhook — usado para deduplicar reentregas do Meta.
+  externalEventId String
+  signatureValid  Boolean
+  payload         Json
+  status          WebhookEventStatus @default(RECEIVED)
+  erro            String?
+  criadoEm        DateTime           @default(now()) @db.Timestamptz()
+  processadoEm    DateTime?          @db.Timestamptz()
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+
+  @@unique([provider, externalEventId])
+  @@index([tenantId])
+  @@index([status])
+  @@map("channel_webhook_events")
+}
+
+// ---------------------------------------------------------------------------
+// Contatos / Conversas
+// ---------------------------------------------------------------------------
+
+enum ConversaStatus {
+  ATIVA
+  AGUARDANDO_RESPOSTA
+  FINALIZADA
+
+  @@map("conversa_status")
+}
+
+model Contato {
+  id       String   @id @default(uuid()) @db.Uuid
+  tenantId String   @db.Uuid
+  telefone String
+  nome     String?
+  criadoEm DateTime @default(now()) @db.Timestamptz()
+
+  /// Preenchido enquanto um Agente IA está conduzindo a conversa deste contato
+  /// (nó "Agente IA" acionado num workflow) — enquanto setado, novas mensagens
+  /// do contato vão direto para o agente e NÃO disparam avaliação de gatilhos
+  /// de workflow. Limpo quando o próprio agente decide transferir para humano.
+  agenteAtivoId    String?   @db.Uuid
+  agenteAtivoDesde DateTime? @db.Timestamptz()
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agenteAtivo        Agente?             @relation(fields: [agenteAtivoId], references: [id], onDelete: SetNull)
+  conversas          Conversa[]
+  workflowExecutions WorkflowExecution[]
+  mensagens          Mensagem[]
+
+  @@unique([tenantId, telefone])
+  @@index([tenantId])
+  @@index([agenteAtivoId])
+  @@map("contatos")
+}
+
+enum MensagemDirecao {
+  ENTRADA
+  SAIDA
+
+  @@map("mensagem_direcao")
+}
+
+enum MensagemTipo {
+  TEXTO
+  BOTOES
+  MIDIA
+
+  @@map("mensagem_tipo")
+}
+
+/// Histórico normalizado de mensagens trocadas com um contato, através de
+/// qualquer canal — usado como contexto de conversa para os Agentes IA e como
+/// trilha de auditoria das execuções de workflow. Independente de `Conversa`
+/// (que hoje só existe para WhatsApp e não guarda o conteúdo das mensagens).
+model Mensagem {
+  id        String          @id @default(uuid()) @db.Uuid
+  tenantId  String          @db.Uuid
+  contatoId String          @db.Uuid
+  canal     Canal
+  direcao   MensagemDirecao
+  tipo      MensagemTipo    @default(TEXTO)
+  conteudo  String?
+  criadoEm  DateTime        @default(now()) @db.Timestamptz()
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contato Contato @relation(fields: [contatoId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([contatoId, criadoEm])
+  @@map("mensagens")
+}
+
+model Conversa {
+  id                   String         @id @default(uuid()) @db.Uuid
+  contatoId            String         @db.Uuid
+  whatsappConnectionId String         @db.Uuid
+  status               ConversaStatus @default(ATIVA)
+  criadoEm             DateTime       @default(now()) @db.Timestamptz()
+  atualizadoEm         DateTime       @updatedAt @db.Timestamptz()
+
+  contato            Contato            @relation(fields: [contatoId], references: [id], onDelete: Cascade)
+  whatsappConnection WhatsAppConnection @relation(fields: [whatsappConnectionId], references: [id], onDelete: Cascade)
+
+  @@index([contatoId])
+  @@index([whatsappConnectionId])
+  @@map("conversas")
+}
+
+// ---------------------------------------------------------------------------
+// Workflow builder (grafo editável)
+// ---------------------------------------------------------------------------
+
+enum WorkflowStatus {
+  RASCUNHO
+  PUBLICADO
+  PAUSADO
+
+  @@map("workflow_status")
+}
+
+/// Canal de mensageria ao qual uma automação (ou um gatilho) pertence.
+/// Apenas WHATSAPP está disponível para conexão real no MVP — INSTAGRAM e
+/// FACEBOOK já existem no domínio para que o gatilho correto apareça assim
+/// que esses canais forem habilitados.
+enum Canal {
+  WHATSAPP
+  INSTAGRAM
+  FACEBOOK
+
+  @@map("canal")
+}
+
+model Workflow {
+  id        String         @id @default(uuid()) @db.Uuid
+  tenantId  String         @db.Uuid
+  nome      String
+  descricao String?
+  status    WorkflowStatus @default(RASCUNHO)
+  canal     Canal          @default(WHATSAPP)
+  version   Int            @default(1)
+
+  /// Snapshot imutável do grafo publicado (nodes + edges + configs).
+  /// O worker sempre executa este snapshot, nunca o grafo em edição.
+  publishedJson Json?
+  publishedAt   DateTime? @db.Timestamptz()
+
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant     Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  nodes      WorkflowNode[]
+  edges      WorkflowEdge[]
+  executions WorkflowExecution[]
+
+  @@index([tenantId])
+  @@map("workflows")
+}
+
+model WorkflowNode {
+  id         String @id @default(uuid()) @db.Uuid
+  /// Id gerado no client (Flutter) para correlacionar upsert sem round-trip.
+  clientId   String
+  workflowId String @db.Uuid
+  /// Denormalizado de Workflow.tenantId para permitir que o repository
+  /// escopeie escritas por tenant sem depender só da camada de service.
+  tenantId   String @db.Uuid
+  nodeTypeId String @db.Uuid
+  posX       Float
+  posY       Float
+  configJson Json
+
+  workflow Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  nodeType NodeType @relation(fields: [nodeTypeId], references: [id])
+
+  edgesSaida   WorkflowEdge[]          @relation("EdgeOrigem")
+  edgesEntrada WorkflowEdge[]          @relation("EdgeDestino")
+  execucoes    WorkflowExecutionNode[]
+
+  @@unique([workflowId, clientId])
+  @@index([workflowId])
+  @@index([tenantId])
+  @@index([nodeTypeId])
+  @@map("workflow_nodes")
+}
+
+model WorkflowEdge {
+  id            String  @id @default(uuid()) @db.Uuid
+  workflowId    String  @db.Uuid
+  /// Denormalizado de Workflow.tenantId — mesmo motivo do WorkflowNode.
+  tenantId      String  @db.Uuid
+  origemNodeId  String  @db.Uuid
+  destinoNodeId String  @db.Uuid
+  /// Quando a origem é um nó condicional (ex.: botões), identifica qual
+  /// saída/handle desta origem dispara esta edge.
+  handleOrigem  String?
+
+  workflow    Workflow     @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  origemNode  WorkflowNode @relation("EdgeOrigem", fields: [origemNodeId], references: [id], onDelete: Cascade)
+  destinoNode WorkflowNode @relation("EdgeDestino", fields: [destinoNodeId], references: [id], onDelete: Cascade)
+
+  @@index([workflowId])
+  @@index([tenantId])
+  @@index([origemNodeId])
+  @@index([destinoNodeId])
+  @@map("workflow_edges")
+}
+
+model NodeType {
+  id               String  @id @default(uuid()) @db.Uuid
+  /// Ex.: "MENSAGEM_SIMPLES" | "MENSAGEM_BOTOES" | "AGUARDAR_RESPOSTA" | "MIDIA"
+  chave            String  @unique
+  label            String
+  descricao        String?
+  icone            String?
+  /// JSON Schema descrevendo os campos configuráveis — usado para gerar o
+  /// formulário no inspector do Flutter dinamicamente.
+  schemaJson       Json
+  /// Chave que o worker usa para despachar a execução deste tipo de nó.
+  executor         String
+  supportsBranches Boolean @default(false)
+  maxOutputs       Int     @default(1)
+  isEnabled        Boolean @default(true)
+  /// Trigger nodes start a workflow (e.g. "on WhatsApp message received")
+  /// and have no input handle — nothing can connect into them.
+  isTrigger        Boolean @default(false)
+  /// Only set for trigger node types — scopes which channel's workflows may
+  /// use this trigger (e.g. the WhatsApp trigger only appears in WhatsApp
+  /// automations). Null for channel-agnostic action node types.
+  canal            Canal?
+  ordem            Int     @default(0)
+
+  nodes WorkflowNode[]
+
+  @@map("node_types")
+}
+
+// ---------------------------------------------------------------------------
+// Execução do workflow (worker)
+// ---------------------------------------------------------------------------
+
+enum WorkflowExecutionStatus {
+  RUNNING
+  WAITING
+  FINISHED
+  FAILED
+  CANCELLED
+
+  @@map("workflow_execution_status")
+}
+
+enum WorkflowExecutionNodeStatus {
+  PENDING
+  RUNNING
+  SUCCESS
+  FAILED
+  SKIPPED
+
+  @@map("workflow_execution_node_status")
+}
+
+model WorkflowExecution {
+  id         String @id @default(uuid()) @db.Uuid
+  workflowId String @db.Uuid
+  contatoId  String @db.Uuid
+
+  /// Versão do workflow que originou esta execução — junto com o índice único
+  /// abaixo, um contato só entra uma vez por versão publicada.
+  workflowVersion Int                     @default(1)
+  currentNodeId   String?                 @db.Uuid
+  status          WorkflowExecutionStatus @default(RUNNING)
+
+  iniciadoEm   DateTime  @default(now()) @db.Timestamptz()
+  finalizadoEm DateTime? @db.Timestamptz()
+
+  workflow Workflow                @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  contato  Contato                 @relation(fields: [contatoId], references: [id], onDelete: Cascade)
+  nodes    WorkflowExecutionNode[]
+  wait     WorkflowExecutionWait?
+
+  @@unique([workflowId, contatoId, workflowVersion])
+  @@index([workflowId])
+  @@index([contatoId])
+  @@index([status])
+  @@map("workflow_executions")
+}
+
+model WorkflowExecutionNode {
+  id           String                      @id @default(uuid()) @db.Uuid
+  executionId  String                      @db.Uuid
+  nodeId       String                      @db.Uuid
+  status       WorkflowExecutionNodeStatus @default(PENDING)
+  input        Json?
+  output       Json?
+  erro         String?
+  iniciadoEm   DateTime?                   @db.Timestamptz()
+  finalizadoEm DateTime?                   @db.Timestamptz()
+  criadoEm     DateTime                    @default(now()) @db.Timestamptz()
+
+  execution WorkflowExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  node      WorkflowNode      @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+
+  /// Trava de idempotência do motor: o INSERT desta linha É o "reivindicar
+  /// este nó" (mesmo padrão de `WorkflowExecution`). Se o motor cair e
+  /// reprocessar a mesma execução do zero, o segundo INSERT colide (P2002) e
+  /// o motor sabe que já cuidou deste nó, sem reenviar mensagem duplicada.
+  @@unique([executionId, nodeId])
+  @@index([executionId])
+  @@index([nodeId])
+  @@map("workflow_execution_nodes")
+}
+
+model WorkflowExecutionWait {
+  id              String    @id @default(uuid()) @db.Uuid
+  executionId     String    @unique @db.Uuid
+  executionNodeId String    @db.Uuid
+  resumeAt        DateTime  @db.Timestamptz()
+  /// Ids dos nós restantes a processar quando a espera resolver.
+  pendingQueue    Json
+  /// Guarda contra reprocessamento em caso de loop.
+  visitedNodeIds  Json
+  resolvedAt      DateTime? @db.Timestamptz()
+  /// "TIMEOUT" | "REPLY"
+  resolvedReason  String?
+  criadoEm        DateTime  @default(now()) @db.Timestamptz()
+
+  execution WorkflowExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+
+  @@index([resumeAt])
+  @@map("workflow_execution_waits")
+}
+
+// ---------------------------------------------------------------------------
+// Agentes IA
+// ---------------------------------------------------------------------------
+
+enum AgenteTom {
+  PROFISSIONAL
+  CONSULTIVO
+  AMIGAVEL
+  PERSUASIVO
+
+  @@map("agente_tom")
+}
+
+enum AgenteStatus {
+  RASCUNHO
+  ATIVO
+  INATIVO
+
+  @@map("agente_status")
+}
+
+model Agente {
+  id       String  @id @default(uuid()) @db.Uuid
+  /// Null apenas para os templates globais da Biblioteca — visíveis a todos
+  /// os tenants, nunca editáveis diretamente (o usuário clona via "Usar
+  /// agente", que cria uma cópia própria com tenantId preenchido).
+  tenantId String? @db.Uuid
+
+  nome     String
+  funcao   String
+  tom      AgenteTom @default(PROFISSIONAL)
+  objetivo String?
+
+  /// Prompt de sistema enviado à OpenAI — descreve como o agente deve agir.
+  instrucoes String
+
+  /// Lista de chaves de ferramentas habilitadas, ex.: ["whatsapp","instagram","facebook","email","webhook","agenda"].
+  /// A UI só permite habilitar canais que o tenant realmente tem conectados.
+  ferramentas Json @default("[]")
+
+  memoriaContextual    Boolean @default(true)
+  horarioInicio        String?
+  horarioFim           String?
+  transferirParaHumano Boolean @default(true)
+
+  /// Envelope AES-256-GCM (mesmo formato do WhatsAppConnection.accessTokenEncrypted)
+  /// — cada agente usa a própria chave OpenAI, cadastrada e gerida pelo
+  /// próprio usuário no painel da OpenAI; nunca retornada em texto puro.
+  openAiApiKeyEncrypted String?
+  openAiModel           String  @default("gpt-4o-mini")
+
+  status AgenteStatus @default(RASCUNHO)
+
+  /// True somente para os 3 templates pré-configurados da Biblioteca.
+  isTemplate             Boolean @default(false)
+  templateChave          String? @unique
+  /// Preenchido quando este agente foi criado via "Usar agente" a partir de
+  /// um template — permite contar quantas vezes cada template da Biblioteca
+  /// foi adotado (métrica real, ao contrário de um contador inventado).
+  clonadoDeTemplateChave String?
+
+  /// Incrementado a cada uso do botão "Testar agente" — única métrica de uso
+  /// real disponível hoje (não há motor de execução de workflow ainda).
+  execucoesTeste Int @default(0)
+
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant         Tenant?   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contatosAtivos Contato[]
+
+  @@index([tenantId])
+  @@map("agentes")
+}
+
+// ---------------------------------------------------------------------------
+// Conexões Meta genéricas (Instagram Direct / Facebook Messenger)
+// ---------------------------------------------------------------------------
+
+enum MetaChannel {
+  INSTAGRAM
+  FACEBOOK
+
+  @@map("meta_channel")
+}
+
+enum MetaChannelConnectionStatus {
+  PENDENTE
+  CONECTADO
+  EXPIRADO
+  ERRO
+
+  @@map("meta_channel_connection_status")
+}
+
+model MetaChannelConnection {
+  id       String      @id @default(uuid()) @db.Uuid
+  tenantId String      @db.Uuid
+  channel  MetaChannel
+
+  pageId              String
+  pageName            String?
+  instagramBusinessId String?
+
+  /// Mesmo envelope AES-256-GCM do WhatsAppConnection.
+  accessTokenEncrypted String
+
+  status       MetaChannelConnectionStatus @default(PENDENTE)
+  conectadoEm  DateTime?                   @db.Timestamptz()
+  criadoEm     DateTime                    @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime                    @updatedAt @db.Timestamptz()
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([channel, pageId])
+  @@index([tenantId])
+  @@map("meta_channel_connections")
+}
+
+// ---------------------------------------------------------------------------
+// Webhooks personalizados
+// ---------------------------------------------------------------------------
+
+model CustomWebhook {
+  id         String  @id @default(uuid()) @db.Uuid
+  tenantId   String  @db.Uuid
+  nomeEvento String
+  descricao  String?
+
+  /// Segmento público da URL (`/custom-webhooks/receive/:tokenPublico`) —
+  /// não é secreto por si só, apenas identifica qual webhook recebeu a
+  /// chamada; a autenticação real é o header `X-Webhook-Secret`.
+  tokenPublico String @unique @default(uuid())
+  /// Hash SHA-256 do secret mostrado ao usuário uma única vez na criação.
+  secretHash   String
+
+  ativo            Boolean   @default(true)
+  criadoEm         DateTime  @default(now()) @db.Timestamptz()
+  ultimoRecebidoEm DateTime? @db.Timestamptz()
+
+  tenant     Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  deliveries CustomWebhookDelivery[]
+
+  @@index([tenantId])
+  @@map("custom_webhooks")
+}
+
+model CustomWebhookDelivery {
+  id         String   @id @default(uuid()) @db.Uuid
+  webhookId  String   @db.Uuid
+  payload    Json
+  recebidoEm DateTime @default(now()) @db.Timestamptz()
+
+  webhook CustomWebhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId])
+  @@map("custom_webhook_deliveries")
+}

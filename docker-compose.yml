@@ -1,0 +1,41 @@
+# Stack LOCAL de desenvolvimento do serviço `backend-engine`.
+#
+# Este repositório NÃO sobe Postgres nem RabbitMQ: a infra pertence ao
+# repositório do serviço backend, que a publica na rede `aureon_net`. Aqui só
+# entramos nessa rede — é assim que os dois serviços se comunicam sem que um
+# conheça o código ou o compose do outro.
+#
+# Ordem para subir a stack completa:
+#   1. no repositório backend:  docker compose up --build
+#   2. aqui:                    docker compose up --build
+#
+# Se a rede não existir ainda, o `up` falha com "network aureon_net declared as
+# external, but could not be found" — é o sintoma de ter pulado o passo 1.
+#
+# Não há `depends_on` para o backend: Compose não enxerga serviços de outro
+# projeto. Se o Postgres ainda não estiver de pé, este container sai no boot e
+# o `restart` o traz de volta até conectar.
+
+name: aureon-engine
+
+services:
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aureon_engine
+    restart: unless-stopped
+    env_file:
+      - .env.dev
+    environment:
+      # Sobrepõem o .env.dev (que aponta para localhost, para quando se roda o
+      # processo fora do Docker). Dentro da rede `aureon_net`, os hosts são os
+      # nomes dos serviços do compose do backend.
+      DATABASE_URL: postgresql://aureon:aureon_local_dev@postgres:5432/aureon_automations?schema=public
+      RABBITMQ_URL: amqp://aureon:aureon_local_dev@rabbitmq:5672
+    networks: [aureon]
+
+networks:
+  aureon:
+    name: aureon_net
+    external: true
