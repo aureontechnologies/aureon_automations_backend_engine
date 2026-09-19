@@ -22,6 +22,7 @@ interface DrainState {
   queue: string[];
   visited: Set<string>;
   incoming?: IncomingMessage;
+  waitResolution?: 'REPLY' | 'TIMEOUT';
 }
 
 /**
@@ -175,11 +176,13 @@ export class WorkflowEngineService {
       queue,
       visited,
       incoming,
+      waitResolution: resolvedReason,
     });
   }
 
   private async drain(state: DrainState): Promise<void> {
-    const { executionId, nodesById, edgesBySource, baseContext, incoming } = state;
+    const { executionId, nodesById, edgesBySource, baseContext, incoming, waitResolution } =
+      state;
     const queue = [...state.queue];
     const visited = state.visited;
 
@@ -196,8 +199,9 @@ export class WorkflowEngineService {
 
       const claim = await this.claimExecutionNode(executionId, node.id);
       if (claim.status === 'SUCCESS') {
-        // Reprocessamento idempotente: este nó já rodou numa tentativa anterior — não reexecuta, só avança.
-        queue.push(...this.successorNodeIds(nodeId, edgesBySource));
+        // Reprocessamento idempotente: este nó já rodou numa tentativa anterior — não reexecuta, só avança
+        // (pelo mesmo ramo escolhido naquela tentativa, se o nó for condicional).
+        queue.push(...this.successorNodeIds(nodeId, edgesBySource, branchFromOutput(claim.output)));
         continue;
       }
       if (claim.status === 'FAILED') {
@@ -209,6 +213,7 @@ export class WorkflowEngineService {
         ...baseContext,
         executionNodeId: claim.executionNodeId,
         incoming,
+        waitResolution,
       };
 
       let result: NodeExecutionResult;
@@ -225,8 +230,12 @@ export class WorkflowEngineService {
       }
 
       if (result.kind === 'ok') {
-        await this.markNodeSuccess(claim.executionNodeId, result.output);
-        queue.push(...this.successorNodeIds(nodeId, edgesBySource));
+        // O ramo escolhido vai junto no output: é o que permite ao reprocessamento idempotente
+        // (acima) seguir o MESMO caminho sem reexecutar o nó.
+        const output =
+          result.branch === undefined ? result.output : { ...result.output, branch: result.branch };
+        await this.markNodeSuccess(claim.executionNodeId, output);
+        queue.push(...this.successorNodeIds(nodeId, edgesBySource, result.branch));
         continue;
       }
 
@@ -256,7 +265,11 @@ export class WorkflowEngineService {
   private async claimExecutionNode(
     executionId: string,
     nodeId: string,
-  ): Promise<{ status: 'PENDING' | 'SUCCESS' | 'FAILED'; executionNodeId: string }> {
+  ): Promise<{
+    status: 'PENDING' | 'SUCCESS' | 'FAILED';
+    executionNodeId: string;
+    output?: Prisma.JsonValue;
+  }> {
     try {
       const created = await this.prisma.workflowExecutionNode.create({
         data: { executionId, nodeId, status: 'RUNNING', iniciadoEm: new Date() },
@@ -270,6 +283,7 @@ export class WorkflowEngineService {
         return {
           status: (existing?.status as 'SUCCESS' | 'FAILED') ?? 'PENDING',
           executionNodeId: existing!.id,
+          output: existing?.output,
         };
       }
       throw error;
@@ -341,10 +355,20 @@ export class WorkflowEngineService {
     return map;
   }
 
+  /** Com `branch`, só as arestas que saem daquele handle; sem, todas as de saída do nó. */
   private successorNodeIds(
     nodeId: string,
     edgesBySource: Map<string, PublishedEdge[]>,
+    branch?: string,
   ): string[] {
-    return (edgesBySource.get(nodeId) ?? []).map((edge) => edge.destinoNodeId);
+    return (edgesBySource.get(nodeId) ?? [])
+      .filter((edge) => branch === undefined || edge.handleOrigem === branch)
+      .map((edge) => edge.destinoNodeId);
   }
+}
+
+function branchFromOutput(output: Prisma.JsonValue | undefined): string | undefined {
+  if (!output || typeof output !== 'object' || Array.isArray(output)) return undefined;
+  const branch = (output as Record<string, unknown>).branch;
+  return typeof branch === 'string' ? branch : undefined;
 }

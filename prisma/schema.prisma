@@ -11,20 +11,37 @@ datasource db {
 // Auth / Tenancy
 // ---------------------------------------------------------------------------
 
-model Tenant {
-  id       String   @id @default(uuid()) @db.Uuid
-  nome     String
-  criadoEm DateTime @default(now()) @db.Timestamptz()
+/// Plano contratado pelo tenant. Os LIMITES de cada plano não moram no banco:
+/// vivem em `plan-catalog.ts`, fonte única consumida pela API, pelo web e
+/// (via `GET /plans/current`) por qualquer cliente — mudar um limite é mudar
+/// um arquivo, não migrar dados.
+enum PlanoTipo {
+  STARTER
+  GROWTH
+  SCALE
 
-  usuarios               Usuario[]
-  whatsappConnections    WhatsAppConnection[]
-  contatos               Contato[]
-  workflows              Workflow[]
-  webhookEvents          ChannelWebhookEvent[]
-  agentes                Agente[]
-  metaChannelConnections MetaChannelConnection[]
-  customWebhooks         CustomWebhook[]
-  mensagens              Mensagem[]
+  @@map("plano_tipo")
+}
+
+model Tenant {
+  id       String    @id @default(uuid()) @db.Uuid
+  nome     String
+  /// Tenants novos nascem no plano de entrada. A migration que criou este
+  /// campo promoveu os tenants JÁ existentes a GROWTH, que era o plano que
+  /// a interface exibia para todos até então.
+  plano    PlanoTipo @default(STARTER)
+  criadoEm DateTime  @default(now()) @db.Timestamptz()
+
+  usuarios             Usuario[]
+  whatsappConnections  WhatsAppConnection[]
+  instagramConnections InstagramConnection[]
+  facebookConnections  FacebookConnection[]
+  contatos             Contato[]
+  workflows            Workflow[]
+  webhookEvents        ChannelWebhookEvent[]
+  agentes              Agente[]
+  customWebhooks       CustomWebhook[]
+  mensagens            Mensagem[]
 
   @@map("tenants")
 }
@@ -93,6 +110,7 @@ model WhatsAppConnection {
 
   tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   conversas Conversa[]
+  workflows Workflow[]
 
   /// phoneNumberId da Meta é globalmente único — impede que um número
   /// migrado entre tenants sem limpeza cause roteamento cruzado de webhooks.
@@ -262,15 +280,40 @@ model Workflow {
   publishedJson Json?
   publishedAt   DateTime? @db.Timestamptz()
 
+  /// Conexão ESPECÍFICA que dispara esta automação — qual número de WhatsApp,
+  /// qual conta de Instagram, qual Página de Facebook. Cada canal tem a SUA
+  /// tabela de conexões, e no máximo uma destas colunas é preenchida: a do
+  /// `canal` do workflow.
+  ///
+  /// Antes este vínculo só existia dentro do `configJson` do nó de gatilho, o
+  /// que obrigava o roteamento a varrer em memória o `publishedJson` de TODOS
+  /// os workflows publicados a cada mensagem recebida, e impedia qualquer
+  /// garantia de "uma automação ativa por conexão". O `configJson` do gatilho
+  /// continua espelhando o valor, porque é o contrato do snapshot lido pelo
+  /// motor — mas a coluna é a verdade.
+  ///
+  /// `SetNull` ao remover a conexão: o serviço de desconexão pausa antes as
+  /// automações ativas vinculadas, para que nenhuma fique "ativa" presa a nada.
+  whatsappConnectionId  String? @db.Uuid
+  instagramConnectionId String? @db.Uuid
+  facebookConnectionId  String? @db.Uuid
+
   criadoEm     DateTime @default(now()) @db.Timestamptz()
   atualizadoEm DateTime @updatedAt @db.Timestamptz()
 
-  tenant     Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  nodes      WorkflowNode[]
-  edges      WorkflowEdge[]
-  executions WorkflowExecution[]
+  tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  whatsappConnection  WhatsAppConnection?  @relation(fields: [whatsappConnectionId], references: [id], onDelete: SetNull)
+  instagramConnection InstagramConnection? @relation(fields: [instagramConnectionId], references: [id], onDelete: SetNull)
+  facebookConnection  FacebookConnection?  @relation(fields: [facebookConnectionId], references: [id], onDelete: SetNull)
+  nodes               WorkflowNode[]
+  edges               WorkflowEdge[]
+  executions          WorkflowExecution[]
 
   @@index([tenantId])
+  /// Chave do roteamento: "qual automação ATIVA responde por esta conexão".
+  @@index([whatsappConnectionId, status])
+  @@index([instagramConnectionId, status])
+  @@index([facebookConnectionId, status])
   @@map("workflows")
 }
 
@@ -523,47 +566,90 @@ model Agente {
 }
 
 // ---------------------------------------------------------------------------
-// Conexões Meta genéricas (Instagram Direct / Facebook Messenger)
+// Conexões do Instagram (Direct)
 // ---------------------------------------------------------------------------
 
-enum MetaChannel {
-  INSTAGRAM
-  FACEBOOK
-
-  @@map("meta_channel")
-}
-
-enum MetaChannelConnectionStatus {
+enum InstagramConnectionStatus {
   PENDENTE
   CONECTADO
   EXPIRADO
   ERRO
 
-  @@map("meta_channel_connection_status")
+  @@map("instagram_connection_status")
 }
 
-model MetaChannelConnection {
-  id       String      @id @default(uuid()) @db.Uuid
-  tenantId String      @db.Uuid
-  channel  MetaChannel
+/// Conta profissional do Instagram conectada pela "Instagram API with
+/// Instagram Login" — a pessoa entra com a própria conta, sem Página do
+/// Facebook. Contraparte da `WhatsAppConnection`, com tabela própria.
+model InstagramConnection {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
 
-  pageId              String
-  pageName            String?
-  instagramBusinessId String?
+  /// Id da conta profissional (`user_id` do /me) — é o `recipient.id` dos
+  /// webhooks, e por isso a chave do roteamento de mensagens recebidas.
+  instagramUserId String
+  username        String?
 
-  /// Mesmo envelope AES-256-GCM do WhatsAppConnection.
+  /// Mesmo envelope AES-256-GCM do WhatsAppConnection. Token de usuário do
+  /// Instagram (graph.instagram.com).
+  accessTokenEncrypted String
+  /// O token longo vale 60 dias e precisa ser renovado antes disso.
+  tokenExpiresAt       DateTime? @db.Timestamptz()
+
+  status       InstagramConnectionStatus @default(PENDENTE)
+  conectadoEm  DateTime?                 @db.Timestamptz()
+  criadoEm     DateTime                  @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime                  @updatedAt @db.Timestamptz()
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  workflows Workflow[]
+
+  /// Uma conta do Instagram pertence a um único tenant — impede roteamento
+  /// cruzado de webhooks.
+  @@unique([instagramUserId])
+  @@index([tenantId])
+  @@map("instagram_connections")
+}
+
+// ---------------------------------------------------------------------------
+// Conexões do Facebook Messenger
+// ---------------------------------------------------------------------------
+
+enum FacebookConnectionStatus {
+  PENDENTE
+  CONECTADO
+  EXPIRADO
+  ERRO
+
+  @@map("facebook_connection_status")
+}
+
+/// Página do Facebook conectada para o Messenger. A tabela já existe para o
+/// vínculo com automações e os limites do plano; o fluxo de conexão e o
+/// webhook do Messenger ainda serão integrados.
+model FacebookConnection {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+
+  /// Id da Página — o `recipient.id` dos webhooks do Messenger.
+  pageId   String
+  pageName String?
+
+  /// Mesmo envelope AES-256-GCM do WhatsAppConnection. Token de Página
+  /// (graph.facebook.com).
   accessTokenEncrypted String
 
-  status       MetaChannelConnectionStatus @default(PENDENTE)
-  conectadoEm  DateTime?                   @db.Timestamptz()
-  criadoEm     DateTime                    @default(now()) @db.Timestamptz()
-  atualizadoEm DateTime                    @updatedAt @db.Timestamptz()
+  status       FacebookConnectionStatus @default(PENDENTE)
+  conectadoEm  DateTime?                @db.Timestamptz()
+  criadoEm     DateTime                 @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime                 @updatedAt @db.Timestamptz()
 
-  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  workflows Workflow[]
 
-  @@unique([channel, pageId])
+  @@unique([pageId])
   @@index([tenantId])
-  @@map("meta_channel_connections")
+  @@map("facebook_connections")
 }
 
 // ---------------------------------------------------------------------------

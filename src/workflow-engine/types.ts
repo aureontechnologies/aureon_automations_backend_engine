@@ -41,15 +41,26 @@ export interface NodeExecutionContext {
   executionId: string;
   /** `WorkflowExecutionNode.id` do nó sendo executado agora — usado como chave de idempotência dos eventos de envio publicados por este nó. */
   executionNodeId: string;
-  /** Conexão (WhatsAppConnection/MetaChannelConnection) resolvida do nó-gatilho publicado — usada por todo nó de envio deste fluxo. */
+  /** Conexão (WhatsAppConnection/InstagramConnection/FacebookConnection) resolvida do nó-gatilho publicado — usada por todo nó de envio deste fluxo. */
   connectionId: string;
-  /** Presente apenas quando esta rodada foi retomada por uma resposta (não por timeout nem no disparo inicial). */
+  /** A mensagem que originou esta rodada: a do disparo inicial ou a resposta que resolveu uma espera. Ausente quando a rodada foi retomada por timeout. */
   incoming?: IncomingMessage;
+  /**
+   * Como terminou a espera que retomou esta rodada — `REPLY` (o contato
+   * respondeu) ou `TIMEOUT` (o prazo esgotou). Ausente na rodada do disparo
+   * inicial, em que nenhuma espera aconteceu ainda.
+   */
+  waitResolution?: 'REPLY' | 'TIMEOUT';
 }
 
 /** Sinaliza ao motor "pare de andar o grafo agora e persista o estado" — sem lançar exceção, controle de fluxo explícito (mesmo espírito de `SuspendWorkflow`/`RestartWorkflow` da referência). */
 export type NodeExecutionResult =
-  | { kind: 'ok'; output?: Record<string, unknown> }
+  /**
+   * `branch` presente = nó condicional (if/else) que decide na hora, sem
+   * suspender: o motor segue SÓ a aresta cujo `handleOrigem` é igual a ele.
+   * Ausente = segue todas as arestas de saída, como sempre.
+   */
+  | { kind: 'ok'; output?: Record<string, unknown>; branch?: string }
   | { kind: 'suspend'; resumeAt: Date; motivo: string; output?: Record<string, unknown> }
   | { kind: 'finish'; output?: Record<string, unknown> };
 

@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { AgentConversationModule } from '../agent-conversation/agent-conversation.module';
 import { EngineTriggersConsumer } from '../consumers/engine-triggers.consumer';
 import { ContatosModule } from '../contatos/contatos.module';
+import { IfContactRepliedHandler } from './handlers/if-contact-replied.handler';
 import { SendButtonsMessageHandler } from './handlers/send-buttons-message.handler';
 import { SendMediaMessageHandler } from './handlers/send-media-message.handler';
 import { SendTextMessageHandler } from './handlers/send-text-message.handler';
@@ -35,6 +36,7 @@ import { WaitTimeoutPollerService } from './wait-timeout-poller.service';
     SendMediaMessageHandler,
     WaitForReplyHandler,
     TriggerAiAgentHandler,
+    IfContactRepliedHandler,
   ],
   exports: [WorkflowEngineService, WaitResolverService],
 })
