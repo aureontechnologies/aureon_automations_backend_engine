@@ -196,10 +196,27 @@ enum MensagemDirecao {
   @@map("mensagem_direcao")
 }
 
+/// O que o contato mandou (ou o que o sistema enviou). Um valor por FORMA de
+/// mensagem — é o que permite ao Agente IA e às automações saberem se veio
+/// texto, uma foto, uma localização ou um clique em botão.
+///
+/// `MIDIA` continua existindo por compatibilidade: é o que os nós de envio
+/// usam para qualquer anexo que o sistema manda.
 enum MensagemTipo {
   TEXTO
   BOTOES
   MIDIA
+  IMAGEM
+  VIDEO
+  AUDIO
+  DOCUMENTO
+  STICKER
+  LOCALIZACAO
+  CONTATO
+  REACAO
+  COMPARTILHAMENTO
+  STORY
+  NAO_SUPORTADO
 
   @@map("mensagem_tipo")
 }
@@ -215,7 +232,14 @@ model Mensagem {
   canal     Canal
   direcao   MensagemDirecao
   tipo      MensagemTipo    @default(TEXTO)
+  /// Texto legível da mensagem — o que o contato escreveu ou, quando não há
+  /// texto, uma descrição do que chegou ("[imagem]", "[localização] …"). É o
+  /// que o Agente IA lê como histórico da conversa.
   conteudo  String?
+  /// O que veio além do texto, já normalizado: anexos (url ou id da mídia),
+  /// localização, cartão de contato, reação e a que story/post a mensagem
+  /// responde. Forma em `inbound-message.dto.ts`.
+  metadata  Json?
   criadoEm  DateTime        @default(now()) @db.Timestamptz()
 
   tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)

@@ -1,4 +1,12 @@
 import { Canal } from '@prisma/client';
+import type {
+  InboundAttachment,
+  InboundContactCard,
+  InboundLocation,
+  InboundMessageTipo,
+  InboundReaction,
+  InboundReplyContext,
+} from '../messaging/inbound-message';
 
 export interface PublishedNode {
   id: string;
@@ -23,11 +31,24 @@ export interface PublishedWorkflowSnapshot {
   edges: PublishedEdge[];
 }
 
-/** A mensagem que originou esta rodada de execução (disparo inicial ou resposta que resolveu uma espera). */
+/**
+ * A mensagem que originou esta rodada de execução (disparo inicial ou resposta
+ * que resolveu uma espera), já normalizada pelo backend.
+ *
+ * `conteudo` é a linha legível ("[imagem] essa cor ficou linda"); `texto` é só
+ * o que o contato escreveu. Os campos estruturados existem para que um nó —
+ * ou o Agente IA — possa reagir ao que de fato chegou.
+ */
 export interface IncomingMessage {
   conteudo: string | null;
-  tipo: 'TEXTO' | 'BOTOES' | 'MIDIA';
+  texto?: string | null;
+  tipo: InboundMessageTipo;
   interactiveReplyId?: string | null;
+  anexos?: InboundAttachment[];
+  localizacao?: InboundLocation;
+  contatoCompartilhado?: InboundContactCard;
+  reacao?: InboundReaction;
+  respostaA?: InboundReplyContext;
   occurredAt: string;
 }
 

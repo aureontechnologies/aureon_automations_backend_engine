@@ -50,8 +50,14 @@ export class EngineTriggersConsumer {
     const contato = await this.contatoRepository.findById(event.contatoId);
     const incoming = {
       conteudo: event.conteudo,
+      texto: event.texto,
       tipo: event.tipo,
       interactiveReplyId: event.interactiveReplyId,
+      anexos: event.anexos,
+      localizacao: event.localizacao,
+      contatoCompartilhado: event.contatoCompartilhado,
+      reacao: event.reacao,
+      respostaA: event.respostaA,
       occurredAt: event.occurredAt,
     };
 

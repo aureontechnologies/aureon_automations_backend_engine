@@ -132,7 +132,7 @@ describe('Nó "Mensagem com Botões" (send_buttons_message)', () => {
     const botoesNode = node({ texto: 'Olá', botoes });
     const reply = (interactiveReplyId: string | null) => ({
       conteudo: 'x',
-      tipo: 'BOTOES' as const,
+      tipo: 'BOTAO' as const,
       interactiveReplyId,
       occurredAt: new Date().toISOString(),
     });

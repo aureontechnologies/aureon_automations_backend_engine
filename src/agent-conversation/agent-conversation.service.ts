@@ -66,7 +66,7 @@ export class AgentConversationService {
       HISTORY_LIMIT,
     );
 
-    const systemPrompt = this.buildSystemPrompt(agente.instrucoes);
+    const systemPrompt = this.buildSystemPrompt(agente.instrucoes, input.canal);
     const messages = [
       { role: 'system' as const, content: systemPrompt },
       ...historico
@@ -110,7 +110,23 @@ export class AgentConversationService {
     return { status: 'respondeu', transferido };
   }
 
-  private buildSystemPrompt(instrucoes: string): string {
-    return `${instrucoes}\n\nSe em algum momento você decidir que a conversa precisa ser transferida para um atendente humano, inclua exatamente o texto "${TRANSFER_MARKER}" no final da sua resposta.`;
+  private buildSystemPrompt(instrucoes: string, canal: Canal): string {
+    const canalLabel = {
+      WHATSAPP: 'WhatsApp',
+      INSTAGRAM: 'Instagram Direct',
+      FACEBOOK: 'Facebook Messenger',
+    }[canal];
+
+    // O histórico é texto: o que o contato manda sem ser texto chega descrito
+    // entre colchetes (ver `inbound-message.util.ts` no backend). Dizer isso
+    // ao agente evita que ele finja ter visto a foto — e o ensina a pedir o
+    // que falta.
+    return [
+      instrucoes,
+      '',
+      `Você está atendendo pelo ${canalLabel}.`,
+      'No histórico, o que o contato mandou sem ser texto aparece descrito entre colchetes: [imagem], [vídeo], [áudio], [documento], [figurinha], [localização], [contato], [reação], [botão], [publicação compartilhada] e [resposta a story]. Você NÃO enxerga o conteúdo desses arquivos — use a descrição e, se precisar do conteúdo, peça ao contato que descreva ou escreva.',
+      `Se em algum momento você decidir que a conversa precisa ser transferida para um atendente humano, inclua exatamente o texto "${TRANSFER_MARKER}" no final da sua resposta.`,
+    ].join('\n');
   }
 }
