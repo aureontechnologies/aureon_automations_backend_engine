@@ -88,11 +88,28 @@ function buildEngine(snapshot: PublishedWorkflowSnapshot = SNAPSHOT) {
       }),
     },
     workflowExecutionWait: {
-      create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => {
-        const wait = { id: `wait-${waits.length + 1}`, ...data };
-        waits.push(wait);
-        return wait;
-      }),
+      // `executionId` é único no banco: uma execução tem no máximo UMA espera
+      // pendente, reaproveitada a cada nova suspensão.
+      upsert: jest.fn(
+        async ({
+          where,
+          create,
+          update,
+        }: {
+          where: { executionId: string };
+          create: Record<string, unknown>;
+          update: Record<string, unknown>;
+        }) => {
+          const existente = waits.find((w) => w.executionId === where.executionId);
+          if (existente) {
+            Object.assign(existente, update);
+            return existente;
+          }
+          const wait = { id: `wait-${waits.length + 1}`, ...create };
+          waits.push(wait);
+          return wait;
+        },
+      ),
     },
   };
   const contatos = {
@@ -107,8 +124,26 @@ function buildEngine(snapshot: PublishedWorkflowSnapshot = SNAPSHOT) {
     return { kind: 'ok' };
   });
 
-  const engine = new WorkflowEngineService(prisma as never, registry, contatos as never);
-  return { engine, nodeRows, waits, execution, ran };
+  // Guarda quantas esperas já estavam gravadas no instante da publicação — é
+  // o que prova a ORDEM (gravar a espera, depois publicar).
+  const publicados: Array<{
+    key: string;
+    event: Record<string, unknown>;
+    esperasGravadas: number;
+  }> = [];
+  const messaging = {
+    publish: jest.fn((key: string, event: Record<string, unknown>) =>
+      publicados.push({ key, event, esperasGravadas: waits.length }),
+    ),
+  };
+
+  const engine = new WorkflowEngineService(
+    prisma as never,
+    registry,
+    contatos as never,
+    messaging as never,
+  );
+  return { engine, registry, nodeRows, waits, execution, ran, publicados };
 }
 
 const TRIGGER_EVENT = {
@@ -190,6 +225,71 @@ describe('WorkflowEngineService — nó "Contato respondeu?"', () => {
     await engine.runFromTrigger(TRIGGER_EVENT);
 
     expect(ran).toEqual(['yes']);
+  });
+
+  it('nó que suspende publica a mensagem SÓ depois de gravar a espera', async () => {
+    // Ordem invertida deixaria uma janela em que o contato já clicou e ainda
+    // não existe espera para aquele clique resolver.
+    const comBotoes = {
+      ...SNAPSHOT,
+      nodes: [
+        ...SNAPSHOT.nodes,
+        { id: 'botoes', clientId: 'b', isTrigger: false, executor: 'botoes', configJson: {} },
+      ],
+      edges: [
+        { origemNodeId: 'trigger', destinoNodeId: 'botoes' },
+        ...SNAPSHOT.edges.filter((e) => e.origemNodeId !== 'trigger'),
+      ],
+    };
+    const { engine, registry, publicados } = buildEngine(comBotoes);
+    registry.register('botoes', async () => ({
+      kind: 'suspend',
+      resumeAt: new Date(Date.now() + 60_000),
+      motivo: 'AGUARDANDO_CLIQUE_BOTAO',
+      publicarAposEspera: {
+        routingKey: 'channel.message.send',
+        event: { kind: 'botoes' },
+      },
+    }));
+
+    await engine.runFromTrigger(TRIGGER_EVENT);
+
+    expect(publicados).toEqual([
+      { key: 'channel.message.send', event: { kind: 'botoes' }, esperasGravadas: 1 },
+    ]);
+  });
+
+  it('um fluxo com DUAS esperas seguidas reaproveita a mesma linha de espera', async () => {
+    // "Mensagem com Botões" (espera o clique) e depois "Aguardar resposta" —
+    // o caso que quebrava com "Unique constraint failed on (executionId)".
+    const duasEsperas = {
+      ...SNAPSHOT,
+      nodes: [
+        ...SNAPSHOT.nodes,
+        { id: 'wait2', clientId: 'w2', isTrigger: false, executor: 'wait_for_reply', configJson: {} },
+      ],
+      edges: [
+        { origemNodeId: 'trigger', destinoNodeId: 'wait' },
+        { origemNodeId: 'wait', destinoNodeId: 'wait2' },
+        { origemNodeId: 'wait2', destinoNodeId: 'check' },
+        { origemNodeId: 'check', destinoNodeId: 'yes', handleOrigem: 'sim' },
+        { origemNodeId: 'check', destinoNodeId: 'no', handleOrigem: 'nao' },
+      ],
+    };
+    const { engine, waits, execution, ran } = buildEngine(duasEsperas);
+
+    await engine.runFromTrigger(TRIGGER_EVENT);
+    await engine.resumeWait(waits[0] as never, 'REPLY', REPLY);
+
+    expect(waits).toHaveLength(1);
+    expect(execution.status).toBe('WAITING');
+    expect(waits[0].pendingQueue).toEqual(['check']);
+    expect(waits[0].resolvedAt).toBeNull();
+
+    await engine.resumeWait(waits[0] as never, 'REPLY', REPLY);
+
+    expect(ran).toEqual(['yes']);
+    expect(execution.status).toBe('FINISHED');
   });
 
   it('no reprocessamento, segue o MESMO ramo já escolhido sem reexecutar o nó', async () => {

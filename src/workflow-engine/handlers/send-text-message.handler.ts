@@ -25,6 +25,9 @@ export class SendTextMessageHandler {
     context: NodeExecutionContext,
   ): Promise<NodeExecutionResult> {
     const texto = renderTemplate(String(node.configJson.texto ?? ''), context);
+    if (!texto.trim()) {
+      throw new Error('Nó "Mensagem" sem texto para enviar.');
+    }
 
     const event: ChannelMessageSendEvent = {
       eventId: context.executionNodeId,

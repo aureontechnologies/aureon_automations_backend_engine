@@ -33,6 +33,9 @@ export class TriggerAiAgentHandler {
       throw new Error('Nó "Agente IA" sem agentId configurado.');
     }
 
+    // Uma falha aqui (agente sem chave da OpenAI, OpenAI fora do ar) precisa
+    // aparecer como execução FALHADA na tela de Execuções — silenciar deixaria
+    // o contato sem resposta e o cliente sem saber por quê.
     const outcome = await this.agentConversationService.respond({
       tenantId: context.tenantId,
       contatoId: context.contatoId,
@@ -43,6 +46,18 @@ export class TriggerAiAgentHandler {
       connectionId: context.connectionId,
     });
 
-    return { kind: 'finish', output: { agentId, outcome: outcome.status } };
+    if (outcome.status === 'sem_chave_configurada') {
+      throw new Error(
+        `Agente ${agentId} está sem chave da OpenAI configurada — não foi possível responder.`,
+      );
+    }
+    if (outcome.status === 'falha_openai') {
+      throw new Error(`Falha ao acionar o Agente IA: ${outcome.motivo}`);
+    }
+
+    return {
+      kind: 'finish',
+      output: { agentId, transferidoParaHumano: outcome.transferido },
+    };
   }
 }

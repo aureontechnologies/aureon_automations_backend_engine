@@ -132,6 +132,26 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 
 ---
 
+## Nós que o motor executa
+
+Um por tipo do catálogo (`prisma/seed.ts` no backend), nos três canais —
+WhatsApp, Instagram Direct e Facebook Messenger. O motor nunca fala com a Meta:
+ele publica o pedido em `channel.message.send`, e o backend (dispatcher)
+resolve a credencial da conexão e chama a API do canal.
+
+| Nó | Executor | O que faz |
+|---|---|---|
+| Mensagem | `send_text_message` | Publica o texto, com `{{nome}}`/`{{telefone}}` já substituídos. |
+| Mensagem com Botões | `send_buttons_message` | Suspende esperando o clique; a aresta seguida é a do botão clicado. A mensagem só é publicada DEPOIS que a espera está gravada — senão um clique instantâneo não teria espera para resolver. |
+| Enviar Mídia | `send_media_message` | Publica imagem, vídeo ou documento com legenda. |
+| Aguardar Resposta | `wait_for_reply` | Suspende por `timeoutMinutos`; resolve por resposta do contato ou pelo poller de timeout. |
+| Contato respondeu? | `if_contact_replied` | Decide na hora, sem suspender: segue "sim" se a espera terminou com resposta, "não" se o prazo esgotou. |
+| Agente IA | `trigger_ai_agent` | Entrega a conversa ao agente (OpenAI) e ENCERRA o fluxo; as mensagens seguintes do contato são respondidas pelo agente, fora do grafo, até ele transferir para um humano. |
+
+Uma execução tem no máximo UMA espera pendente (`workflow_execution_waits.executionId`
+é único) e a mesma linha é reaproveitada a cada nova suspensão — um fluxo com
+botões e depois "Aguardar Resposta" passa por duas.
+
 ## Pontos de atenção
 
 **Escalar além de 1 réplica.** O `wait-timeout-poller.service.ts` roda dentro

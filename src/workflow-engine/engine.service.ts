@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Prisma, WorkflowExecutionWait } from '@prisma/client';
 import { ContatoRepository } from '../contatos/contato.repository';
+import { MessagingService } from '../messaging/messaging.service';
 import { AutomationTriggerEvent } from '../messaging/automation-trigger.event';
 import { PrismaService } from '../prisma/prisma.service';
 import { NodeExecutorRegistry } from './node-executor.registry';
@@ -44,6 +45,7 @@ export class WorkflowEngineService {
     private readonly prisma: PrismaService,
     private readonly registry: NodeExecutorRegistry,
     private readonly contatoRepository: ContatoRepository,
+    private readonly messagingService: MessagingService,
   ) {}
 
   async runFromTrigger(event: AutomationTriggerEvent): Promise<void> {
@@ -256,6 +258,14 @@ export class WorkflowEngineService {
         where: { id: executionId },
         data: { status: 'WAITING' },
       });
+      if (result.publicarAposEspera) {
+        // Só agora: a espera já existe, então a resposta do contato — por mais
+        // rápida que venha — encontra o que resolver.
+        this.messagingService.publish(
+          result.publicarAposEspera.routingKey,
+          result.publicarAposEspera.event,
+        );
+      }
       return;
     }
 
@@ -334,14 +344,24 @@ export class WorkflowEngineService {
     pendingQueue: string[],
     visited: Set<string>,
   ): Promise<void> {
-    await this.prisma.workflowExecutionWait.create({
-      data: {
-        executionId,
-        executionNodeId,
-        resumeAt,
-        pendingQueue: pendingQueue as unknown as Prisma.InputJsonValue,
-        visitedNodeIds: [...visited] as unknown as Prisma.InputJsonValue,
-      },
+    const data = {
+      executionNodeId,
+      resumeAt,
+      pendingQueue: pendingQueue as unknown as Prisma.InputJsonValue,
+      visitedNodeIds: [...visited] as unknown as Prisma.InputJsonValue,
+      // A espera anterior desta execução já foi resolvida (é o que trouxe o
+      // fluxo até aqui); a linha volta a ficar pendente para a nova espera.
+      resolvedAt: null,
+      resolvedReason: null,
+    };
+    // Uma execução tem no máximo UMA espera pendente (`executionId` é único),
+    // mas passa por várias ao longo do fluxo — "Mensagem com Botões" e depois
+    // "Aguardar Resposta", por exemplo. Por isso a linha é reaproveitada:
+    // criar uma segunda quebraria a execução no meio do caminho.
+    await this.prisma.workflowExecutionWait.upsert({
+      where: { executionId },
+      create: { executionId, ...data },
+      update: data,
     });
   }
 

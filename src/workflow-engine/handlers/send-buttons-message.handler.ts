@@ -44,6 +44,12 @@ export class SendButtonsMessageHandler {
   ): Promise<NodeExecutionResult> {
     const texto = renderTemplate(String(node.configJson.texto ?? ''), context);
     const botoes = this.extractButtons(node);
+    if (!texto.trim()) {
+      throw new Error('Nó "Mensagem com Botões" sem texto para enviar.');
+    }
+    if (botoes.length === 0) {
+      throw new Error('Nó "Mensagem com Botões" sem nenhum botão configurado.');
+    }
 
     const event: ChannelMessageSendEvent = {
       eventId: context.executionNodeId,
@@ -57,13 +63,16 @@ export class SendButtonsMessageHandler {
       botoes,
       correlationId: context.executionId,
     };
-    this.messagingService.publish(RoutingKeys.CHANNEL_MESSAGE_SEND, event as unknown as Record<string, unknown>);
-
     return {
       kind: 'suspend',
       resumeAt: new Date(Date.now() + DEFAULT_TIMEOUT_MINUTES * 60_000),
       motivo: 'AGUARDANDO_CLIQUE_BOTAO',
       output: { texto, botoes },
+      // Quem publica é o motor, depois de gravar a espera — ver `types.ts`.
+      publicarAposEspera: {
+        routingKey: RoutingKeys.CHANNEL_MESSAGE_SEND,
+        event: event as unknown as Record<string, unknown>,
+      },
     };
   }
 

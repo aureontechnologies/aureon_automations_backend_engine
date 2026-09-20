@@ -61,7 +61,19 @@ export type NodeExecutionResult =
    * Ausente = segue todas as arestas de saída, como sempre.
    */
   | { kind: 'ok'; output?: Record<string, unknown>; branch?: string }
-  | { kind: 'suspend'; resumeAt: Date; motivo: string; output?: Record<string, unknown> }
+  /**
+   * `publicarAposEspera` sai na fila só DEPOIS que a espera está gravada. É o
+   * caso da mensagem com botões: publicar antes abre uma janela em que o
+   * contato já pode ter clicado e ainda não existe espera para aquele clique
+   * resolver — e o clique se perderia.
+   */
+  | {
+      kind: 'suspend';
+      resumeAt: Date;
+      motivo: string;
+      output?: Record<string, unknown>;
+      publicarAposEspera?: { routingKey: string; event: Record<string, unknown> };
+    }
   | { kind: 'finish'; output?: Record<string, unknown> };
 
 export type NodeHandler = (

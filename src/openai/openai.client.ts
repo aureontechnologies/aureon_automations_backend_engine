@@ -1,5 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
 
+/**
+ * Endpoint da OpenAI. Configurável por `OPENAI_BASE_URL` para apontar a um
+ * endpoint compatível (Azure OpenAI, gateway próprio) sem mudar código.
+ */
+const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
+
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
@@ -34,7 +40,8 @@ export class OpenAiClient {
   ): Promise<string> {
     let response: Response;
     try {
-      response = await fetch('https://api.openai.com/v1/chat/completions', {
+      const baseUrl = (process.env.OPENAI_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, '');
+      response = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${apiKey}`,

@@ -8,6 +8,15 @@ import { NodeExecutionContext, NodeExecutionResult, PublishedNode } from '../typ
 
 export const SEND_MEDIA_MESSAGE_EXECUTOR = 'send_media_message';
 
+const TIPOS_VALIDOS = ['imagem', 'video', 'documento'] as const;
+type MediaTipo = (typeof TIPOS_VALIDOS)[number];
+
+/**
+ * Envia imagem, vídeo ou documento. O que cada canal aceita de fato é
+ * resolvido no dispatcher (o Direct do Instagram, por exemplo, não tem anexo
+ * de documento e manda o link em texto) — aqui o nó só publica o pedido.
+ */
+
 @Injectable()
 export class SendMediaMessageHandler {
   constructor(
@@ -23,8 +32,16 @@ export class SendMediaMessageHandler {
     node: PublishedNode,
     context: NodeExecutionContext,
   ): Promise<NodeExecutionResult> {
-    const tipo = node.configJson.tipo as 'imagem' | 'video' | 'documento';
-    const url = String(node.configJson.url ?? '');
+    const tipo = node.configJson.tipo as MediaTipo;
+    if (!TIPOS_VALIDOS.includes(tipo)) {
+      throw new Error(
+        `Nó "Enviar Mídia" com tipo inválido (${String(node.configJson.tipo)}).`,
+      );
+    }
+    const url = String(node.configJson.url ?? '').trim();
+    if (!url) {
+      throw new Error('Nó "Enviar Mídia" sem URL do arquivo.');
+    }
     const legenda = node.configJson.legenda
       ? renderTemplate(String(node.configJson.legenda), context)
       : undefined;
