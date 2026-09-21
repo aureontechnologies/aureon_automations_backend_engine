@@ -474,6 +474,10 @@ model WorkflowExecutionNode {
   executionId  String                      @db.Uuid
   nodeId       String                      @db.Uuid
   status       WorkflowExecutionNodeStatus @default(PENDING)
+  /// Qual passagem do fluxo por este nó — 0 é a primeira, e cada nó
+  /// "Reiniciar automação" executado abre a volta seguinte. Guardar a volta é o
+  /// que permite ao fluxo voltar atrás E manter o histórico de cada passagem.
+  volta        Int                         @default(0)
   input        Json?
   output       Json?
   erro         String?
@@ -488,7 +492,11 @@ model WorkflowExecutionNode {
   /// este nó" (mesmo padrão de `WorkflowExecution`). Se o motor cair e
   /// reprocessar a mesma execução do zero, o segundo INSERT colide (P2002) e
   /// o motor sabe que já cuidou deste nó, sem reenviar mensagem duplicada.
-  @@unique([executionId, nodeId])
+  ///
+  /// A `volta` entra na chave porque voltar atrás DEVE reexecutar: sem ela, o
+  /// "Reiniciar automação" colidiria com a passagem anterior e o trecho
+  /// repetido seria pulado em silêncio.
+  @@unique([executionId, nodeId, volta])
   @@index([executionId])
   @@index([nodeId])
   @@map("workflow_execution_nodes")

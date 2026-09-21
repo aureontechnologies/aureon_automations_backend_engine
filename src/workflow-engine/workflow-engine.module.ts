@@ -3,6 +3,7 @@ import { AgentConversationModule } from '../agent-conversation/agent-conversatio
 import { EngineTriggersConsumer } from '../consumers/engine-triggers.consumer';
 import { ContatosModule } from '../contatos/contatos.module';
 import { IfContactRepliedHandler } from './handlers/if-contact-replied.handler';
+import { RestartAutomationHandler } from './handlers/restart-automation.handler';
 import { SendButtonsMessageHandler } from './handlers/send-buttons-message.handler';
 import { SendMediaMessageHandler } from './handlers/send-media-message.handler';
 import { SendTextMessageHandler } from './handlers/send-text-message.handler';
@@ -37,6 +38,7 @@ import { WaitTimeoutPollerService } from './wait-timeout-poller.service';
     WaitForReplyHandler,
     TriggerAiAgentHandler,
     IfContactRepliedHandler,
+    RestartAutomationHandler,
   ],
   exports: [WorkflowEngineService, WaitResolverService],
 })

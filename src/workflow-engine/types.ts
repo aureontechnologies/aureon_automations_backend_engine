@@ -95,7 +95,21 @@ export type NodeExecutionResult =
       output?: Record<string, unknown>;
       publicarAposEspera?: { routingKey: string; event: Record<string, unknown> };
     }
-  | { kind: 'finish'; output?: Record<string, unknown> };
+  | { kind: 'finish'; output?: Record<string, unknown> }
+  /**
+   * Devolve a execução a um nó anterior — é o "Reiniciar automação".
+   *
+   * O alvo vem como `clientId` (o id que o canvas gera e o usuário escolheu na
+   * configuração do nó), e não como id de banco: é o `clientId` que o inspector
+   * conhece, e o snapshot publicado carrega os dois, então o motor resolve a
+   * tradução. O handler não teria como fazê-la — ele não vê o snapshot.
+   *
+   * Voltar significa reexecutar de verdade os nós dali para frente, então o
+   * motor abre uma VOLTA nova da execução (ver `volta` em
+   * `WorkflowExecutionNode`): sem isso, a trava de idempotência que protege o
+   * reprocessamento de eventos duplicados pularia todo o trecho repetido.
+   */
+  | { kind: 'goto'; targetClientId: string; output?: Record<string, unknown> };
 
 export type NodeHandler = (
   node: PublishedNode,

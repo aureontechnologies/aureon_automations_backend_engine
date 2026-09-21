@@ -1,7 +1,8 @@
 import { Prisma } from '@prisma/client';
-import { WorkflowEngineService } from './engine.service';
+import { MAX_VOLTAS, WorkflowEngineService } from './engine.service';
 import { IfContactRepliedHandler } from './handlers/if-contact-replied.handler';
 import { WaitForReplyHandler } from './handlers/wait-for-reply.handler';
+import { RestartAutomationHandler } from './handlers/restart-automation.handler';
 import { NodeExecutorRegistry } from './node-executor.registry';
 import { PublishedWorkflowSnapshot } from './types';
 
@@ -32,13 +33,15 @@ interface NodeRow {
   id: string;
   executionId: string;
   nodeId: string;
+  /** Qual passagem do fluxo por este nó — cada "Reiniciar automação" abre a seguinte. */
+  volta: number;
   status: string;
   output?: unknown;
 }
 
 interface FindWhere {
   id?: string;
-  executionId_nodeId?: { executionId: string; nodeId: string };
+  executionId_nodeId_volta?: { executionId: string; nodeId: string; volta: number };
 }
 
 function buildEngine(snapshot: PublishedWorkflowSnapshot = SNAPSHOT) {
@@ -64,22 +67,43 @@ function buildEngine(snapshot: PublishedWorkflowSnapshot = SNAPSHOT) {
       }),
     },
     workflowExecutionNode: {
-      create: jest.fn(async ({ data }: { data: { executionId: string; nodeId: string } }) => {
-        if (nodeRows.some((r) => r.executionId === data.executionId && r.nodeId === data.nodeId)) {
-          throw new Prisma.PrismaClientKnownRequestError('duplicado', {
-            code: 'P2002',
-            clientVersion: 'test',
-          });
-        }
-        const row: NodeRow = { id: `en-${data.nodeId}`, ...data, status: 'RUNNING' };
-        nodeRows.push(row);
-        return row;
-      }),
+      // A trava de idempotência do banco é (executionId, nodeId, volta): o mesmo
+      // nó numa volta NOVA é uma linha nova, e é isso que deixa o fluxo voltar
+      // atrás sem afrouxar a proteção contra evento duplicado.
+      create: jest.fn(
+        async ({ data }: { data: { executionId: string; nodeId: string; volta: number } }) => {
+          if (
+            nodeRows.some(
+              (r) =>
+                r.executionId === data.executionId &&
+                r.nodeId === data.nodeId &&
+                r.volta === data.volta,
+            )
+          ) {
+            throw new Prisma.PrismaClientKnownRequestError('duplicado', {
+              code: 'P2002',
+              clientVersion: 'test',
+            });
+          }
+          const row: NodeRow = {
+            id: `en-${data.nodeId}-v${data.volta}`,
+            ...data,
+            status: 'RUNNING',
+          };
+          nodeRows.push(row);
+          return row;
+        },
+      ),
       findUnique: jest.fn(async ({ where }: { where: FindWhere }) => {
-        const key = where.executionId_nodeId;
+        const key = where.executionId_nodeId_volta;
         return where.id
           ? nodeRows.find((r) => r.id === where.id)
-          : nodeRows.find((r) => r.executionId === key?.executionId && r.nodeId === key?.nodeId);
+          : nodeRows.find(
+              (r) =>
+                r.executionId === key?.executionId &&
+                r.nodeId === key?.nodeId &&
+                r.volta === key?.volta,
+            );
       }),
       update: jest.fn(async ({ where, data }: { where: { id: string }; data: Partial<NodeRow> }) => {
         const row = nodeRows.find((r) => r.id === where.id)!;
@@ -119,6 +143,7 @@ function buildEngine(snapshot: PublishedWorkflowSnapshot = SNAPSHOT) {
   const registry = new NodeExecutorRegistry();
   new WaitForReplyHandler(registry);
   new IfContactRepliedHandler(registry);
+  new RestartAutomationHandler(registry);
   registry.register('record', async (node) => {
     ran.push(node.id);
     return { kind: 'ok' };
@@ -307,5 +332,134 @@ describe('WorkflowEngineService — nó "Contato respondeu?"', () => {
     await engine.resumeWait(waits[0] as never, 'TIMEOUT');
 
     expect(ran).toEqual(['yes']);
+  });
+});
+
+/**
+ * O fluxo de lembrete, que é o caso real do "Reiniciar automação": espera a
+ * resposta, e se o prazo esgota manda um lembrete e VOLTA para a espera.
+ *
+ *   gatilho → espera → respondeu? --sim--> fim
+ *                               \--não--> lembrete → reinicia (volta p/ espera)
+ */
+const SNAPSHOT_REINICIO: PublishedWorkflowSnapshot = {
+  workflowId: 'wf-1',
+  nome: 'Lembrete',
+  nodes: [
+    { id: 'trigger', clientId: 't', isTrigger: true, executor: 'trigger_whatsapp_message', configJson: { connectionId: 'conn-1' } },
+    { id: 'wait', clientId: 'w', isTrigger: false, executor: 'wait_for_reply', configJson: { timeoutMinutos: 5 } },
+    { id: 'check', clientId: 'c', isTrigger: false, executor: 'if_contact_replied', configJson: {} },
+    { id: 'fim', clientId: 'f', isTrigger: false, executor: 'record', configJson: {} },
+    { id: 'lembrete', clientId: 'l', isTrigger: false, executor: 'record', configJson: {} },
+    { id: 'reinicio', clientId: 'r', isTrigger: false, executor: 'restart_automation', configJson: { nodeClientId: 'w' } },
+  ],
+  edges: [
+    { origemNodeId: 'trigger', destinoNodeId: 'wait' },
+    { origemNodeId: 'wait', destinoNodeId: 'check' },
+    { origemNodeId: 'check', destinoNodeId: 'fim', handleOrigem: 'sim' },
+    { origemNodeId: 'check', destinoNodeId: 'lembrete', handleOrigem: 'nao' },
+    { origemNodeId: 'lembrete', destinoNodeId: 'reinicio' },
+  ],
+};
+
+/** Laço sem espera nenhuma no caminho: só o teto de voltas o interrompe. */
+const SNAPSHOT_LACO: PublishedWorkflowSnapshot = {
+  workflowId: 'wf-1',
+  nome: 'Laço',
+  nodes: [
+    { id: 'trigger', clientId: 't', isTrigger: true, executor: 'trigger_whatsapp_message', configJson: { connectionId: 'conn-1' } },
+    { id: 'msg', clientId: 'm', isTrigger: false, executor: 'record', configJson: {} },
+    { id: 'reinicio', clientId: 'r', isTrigger: false, executor: 'restart_automation', configJson: { nodeClientId: 'm' } },
+  ],
+  edges: [
+    { origemNodeId: 'trigger', destinoNodeId: 'msg' },
+    { origemNodeId: 'msg', destinoNodeId: 'reinicio' },
+  ],
+};
+
+describe('WorkflowEngineService — nó "Reiniciar automação"', () => {
+  it('volta para a espera e a executa DE NOVO, numa volta nova', async () => {
+    const { engine, waits, execution, ran, nodeRows } = buildEngine(SNAPSHOT_REINICIO);
+
+    await engine.runFromTrigger(TRIGGER_EVENT);
+    expect(execution.status).toBe('WAITING');
+
+    // Prazo esgotado: segue por "não", manda o lembrete e reinicia.
+    await engine.resumeWait(waits[0] as never, 'TIMEOUT');
+
+    expect(ran).toEqual(['lembrete']);
+    // A espera foi reaproveitada (uma por execução) e agora aponta para a
+    // passagem NOVA pelo mesmo nó — é isso que prova que ele reexecutou.
+    expect(waits).toHaveLength(1);
+    expect(waits[0].executionNodeId).toBe('en-wait-v1');
+    expect(execution.status).toBe('WAITING');
+
+    // O histórico guarda as duas passagens, em voltas diferentes.
+    const passagens = nodeRows.filter((r) => r.nodeId === 'wait');
+    expect(passagens.map((r) => r.volta)).toEqual([0, 1]);
+
+    // Agora o contato responde: segue por "sim" e encerra.
+    await engine.resumeWait(waits[0] as never, 'REPLY', REPLY);
+
+    expect(ran).toEqual(['lembrete', 'fim']);
+    expect(execution.status).toBe('FINISHED');
+  });
+
+  it('registra para onde voltou e em qual volta', async () => {
+    const { engine, waits, nodeRows } = buildEngine(SNAPSHOT_REINICIO);
+
+    await engine.runFromTrigger(TRIGGER_EVENT);
+    await engine.resumeWait(waits[0] as never, 'TIMEOUT');
+
+    expect(nodeRows.find((r) => r.nodeId === 'reinicio')?.output).toEqual({
+      voltaPara: 'w',
+      volta: 1,
+    });
+  });
+
+  it('para no teto de voltas em vez de girar para sempre', async () => {
+    const { engine, execution, ran } = buildEngine(SNAPSHOT_LACO);
+
+    await engine.runFromTrigger(TRIGGER_EVENT);
+
+    // Uma passagem por volta, da volta 0 até o teto — e então o motor encerra.
+    expect(ran).toHaveLength(MAX_VOLTAS + 1);
+    expect(new Set(ran)).toEqual(new Set(['msg']));
+    expect(execution.status).toBe('FINISHED');
+  });
+
+  it('voltar para o gatilho recomeça pelos sucessores dele', async () => {
+    const snapshot: PublishedWorkflowSnapshot = {
+      ...SNAPSHOT_LACO,
+      // Mesmo laço, mas apontando para o GATILHO — "reiniciar do começo".
+      nodes: SNAPSHOT_LACO.nodes.map((node) =>
+        node.id === 'reinicio' ? { ...node, configJson: { nodeClientId: 't' } } : node,
+      ),
+    };
+    const { engine, execution, ran } = buildEngine(snapshot);
+
+    await engine.runFromTrigger(TRIGGER_EVENT);
+
+    // O gatilho nunca é executado (nem na volta): quem roda é o `msg` depois dele.
+    expect(ran).toHaveLength(MAX_VOLTAS + 1);
+    expect(new Set(ran)).toEqual(new Set(['msg']));
+    expect(execution.status).toBe('FINISHED');
+  });
+
+  it('falha explicitamente quando o destino não existe no snapshot', async () => {
+    const snapshot: PublishedWorkflowSnapshot = {
+      ...SNAPSHOT_LACO,
+      nodes: SNAPSHOT_LACO.nodes.map((node) =>
+        node.id === 'reinicio'
+          ? { ...node, configJson: { nodeClientId: 'nao-existe' } }
+          : node,
+      ),
+    };
+    const { engine, execution, nodeRows } = buildEngine(snapshot);
+
+    await engine.runFromTrigger(TRIGGER_EVENT);
+
+    expect(execution.status).toBe('FAILED');
+    expect(nodeRows.find((r) => r.nodeId === 'reinicio')?.status).toBe('FAILED');
   });
 });

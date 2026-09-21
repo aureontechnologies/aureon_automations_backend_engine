@@ -22,9 +22,30 @@ interface DrainState {
   baseContext: Omit<NodeExecutionContext, 'executionNodeId' | 'incoming'>;
   queue: string[];
   visited: Set<string>;
+  /**
+   * Quantas vezes esta execução já voltou atrás (ver `kind: 'goto'`). Cada
+   * volta reexecuta nós, então ela entra na chave de idempotência — é o que
+   * distingue "o contato passou por aqui de novo" de "o mesmo evento chegou
+   * duas vezes".
+   */
+  volta: number;
   incoming?: IncomingMessage;
   waitResolution?: 'REPLY' | 'TIMEOUT';
 }
+
+/**
+ * Teto de voltas por execução — o freio do "Reiniciar automação".
+ *
+ * Um fluxo que volta para um ponto anterior é, por definição, um ciclo: se o
+ * caminho de volta não passar por uma espera, o motor giraria enviando
+ * mensagens tão rápido quanto a fila aceita. A ativação já recusa alvo
+ * inexistente, mas não há como provar no grafo que o ciclo termina — quem
+ * garante é este limite.
+ *
+ * 25 é folgado para o uso real (lembrar quem não respondeu uma ou duas vezes) e
+ * baixo o bastante para que um laço acidental não vire enxurrada de mensagem.
+ */
+export const MAX_VOLTAS = 25;
 
 /**
  * Anda o grafo publicado de um workflow (BFS), despachando cada nó pelo seu
@@ -105,6 +126,7 @@ export class WorkflowEngineService {
       baseContext,
       queue,
       visited: new Set([triggerNode.id]),
+      volta: 0,
       incoming,
     });
   }
@@ -143,6 +165,9 @@ export class WorkflowEngineService {
       where: { id: wait.executionNodeId },
     });
     const stoppedAtNode = executionNode ? nodesById.get(executionNode.nodeId) : undefined;
+    // A volta em que a execução parou é a do próprio nó que suspendeu — não
+    // precisa ser guardada na espera, já está na linha que a espera aponta.
+    const volta = executionNode?.volta ?? 0;
 
     let queue = (wait.pendingQueue as string[]) ?? [];
     const visited = new Set<string>((wait.visitedNodeIds as string[]) ?? []);
@@ -183,6 +208,7 @@ export class WorkflowEngineService {
       baseContext,
       queue,
       visited,
+      volta,
       incoming,
       waitResolution: resolvedReason,
     });
@@ -205,7 +231,7 @@ export class WorkflowEngineService {
         continue;
       }
 
-      const claim = await this.claimExecutionNode(executionId, node.id);
+      const claim = await this.claimExecutionNode(executionId, node.id, state.volta);
       if (claim.status === 'SUCCESS') {
         // Reprocessamento idempotente: este nó já rodou numa tentativa anterior — não reexecuta, só avança
         // (pelo mesmo ramo escolhido naquela tentativa, se o nó for condicional).
@@ -253,6 +279,56 @@ export class WorkflowEngineService {
         return;
       }
 
+      if (result.kind === 'goto') {
+        const target = this.findByClientId(nodesById, result.targetClientId);
+        if (!target) {
+          // O alvo saiu do grafo depois da publicação (o snapshot é imutável,
+          // então isso só acontece se o nó de reinício tiver sido publicado com
+          // um alvo já inexistente). Falha explícita: seguir em frente aqui
+          // deixaria o contato numa conversa que não continua, sem rastro.
+          const message = `Nó "Reiniciar automação" aponta para um nó que não existe no fluxo publicado (${result.targetClientId}).`;
+          this.logger.error(message);
+          await this.markNodeFailed(claim.executionNodeId, message);
+          await this.markExecutionFailed(executionId, message);
+          return;
+        }
+
+        await this.markNodeSuccess(claim.executionNodeId, {
+          ...result.output,
+          voltaPara: target.clientId,
+          volta: state.volta + 1,
+        });
+
+        if (state.volta + 1 > MAX_VOLTAS) {
+          this.logger.warn(
+            `Execução ${executionId} atingiu o limite de ${MAX_VOLTAS} voltas do "Reiniciar automação" — encerrando para não repetir indefinidamente.`,
+          );
+          await this.markExecutionFinished(executionId);
+          return;
+        }
+
+        /*
+         * Volta nova: os nós dali para frente precisam rodar DE NOVO, e por isso
+         * as duas travas que impedem reexecução saem do caminho de forma
+         * controlada — `visited` é zerado aqui, e a trava do banco é contornada
+         * pela `volta` entrar na chave de idempotência (ver `claimExecutionNode`).
+         *
+         * O gatilho é o único nó que o motor nunca executa; se o alvo for ele,
+         * a volta começa pelos seus sucessores, igual ao disparo inicial.
+         */
+        state.volta += 1;
+        visited.clear();
+        // A volta substitui o que restava do caminho anterior: o fluxo continua
+        // do alvo, não do alvo E de onde tinha parado.
+        queue.length = 0;
+        queue.push(
+          ...(target.isTrigger
+            ? this.successorNodeIds(target.id, edgesBySource)
+            : [target.id]),
+        );
+        continue;
+      }
+
       // result.kind === 'suspend'
       await this.markNodeSuccess(claim.executionNodeId, result.output);
       if (!node.executor || !this.registry.isBranching(node.executor)) {
@@ -278,9 +354,19 @@ export class WorkflowEngineService {
     await this.markExecutionFinished(executionId);
   }
 
+  /**
+   * Reivindica o nó para esta volta da execução.
+   *
+   * A colisão do INSERT (P2002) continua significando "este nó já foi
+   * processado" — mas agora dentro da MESMA volta. Um `goto` abre uma volta
+   * nova, em que o mesmo nó volta a ser um INSERT novo: é assim que o
+   * "Reiniciar automação" reexecuta o trecho sem afrouxar a proteção contra
+   * evento duplicado, que é o que essa trava existe para impedir.
+   */
   private async claimExecutionNode(
     executionId: string,
     nodeId: string,
+    volta: number,
   ): Promise<{
     status: 'PENDING' | 'SUCCESS' | 'FAILED';
     executionNodeId: string;
@@ -288,13 +374,13 @@ export class WorkflowEngineService {
   }> {
     try {
       const created = await this.prisma.workflowExecutionNode.create({
-        data: { executionId, nodeId, status: 'RUNNING', iniciadoEm: new Date() },
+        data: { executionId, nodeId, volta, status: 'RUNNING', iniciadoEm: new Date() },
       });
       return { status: 'PENDING', executionNodeId: created.id };
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
         const existing = await this.prisma.workflowExecutionNode.findUnique({
-          where: { executionId_nodeId: { executionId, nodeId } },
+          where: { executionId_nodeId_volta: { executionId, nodeId, volta } },
         });
         return {
           status: (existing?.status as 'SUCCESS' | 'FAILED') ?? 'PENDING',
@@ -379,6 +465,23 @@ export class WorkflowEngineService {
       map.set(edge.origemNodeId, list);
     }
     return map;
+  }
+
+  /**
+   * O nó pelo `clientId` — é como o "Reiniciar automação" guarda seu alvo.
+   *
+   * Varredura simples de propósito: um fluxo tem dezenas de nós, e um índice a
+   * mais teria de ser criado nos dois pontos de entrada do motor e mantido em
+   * sincronia com `nodesById` por nada.
+   */
+  private findByClientId(
+    nodesById: Map<string, PublishedNode>,
+    clientId: string,
+  ): PublishedNode | undefined {
+    for (const node of nodesById.values()) {
+      if (node.clientId === clientId) return node;
+    }
+    return undefined;
   }
 
   /** Com `branch`, só as arestas que saem daquele handle; sem, todas as de saída do nó. */

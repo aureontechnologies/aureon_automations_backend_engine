@@ -6,6 +6,7 @@ import { NodeExecutorRegistry } from '../node-executor.registry';
 import { RoutingKeys } from '../../messaging/messaging.constants';
 import type { NodeExecutionContext, PublishedNode } from '../types';
 import { IfContactRepliedHandler } from './if-contact-replied.handler';
+import { RestartAutomationHandler } from './restart-automation.handler';
 import { SendButtonsMessageHandler } from './send-buttons-message.handler';
 import { SendMediaMessageHandler } from './send-media-message.handler';
 import { SendTextMessageHandler } from './send-text-message.handler';
@@ -60,6 +61,7 @@ function setup() {
   new SendMediaMessageHandler(registry, messaging as never);
   new WaitForReplyHandler(registry);
   new IfContactRepliedHandler(registry);
+  new RestartAutomationHandler(registry);
   new TriggerAiAgentHandler(registry, agentConversation as never);
   return { registry, published, messaging, agentConversation };
 }
@@ -284,5 +286,34 @@ describe('Nó "Agente IA" (trigger_ai_agent)', () => {
     await expect(
       registry.get('trigger_ai_agent')(node({ agentId: 'a' }), contextFor('WHATSAPP')),
     ).rejects.toThrow(/HTTP 429/);
+  });
+});
+
+describe('Nó "Reiniciar automação" (restart_automation)', () => {
+  it.each(CANAIS)('%s: manda o motor voltar para o nó escolhido', async (canal) => {
+    const { registry, published } = setup();
+
+    const result = await registry.get('restart_automation')(
+      node({ nodeClientId: 'cid-da-pergunta' }),
+      contextFor(canal),
+    );
+
+    expect(result).toEqual({ kind: 'goto', targetClientId: 'cid-da-pergunta' });
+    // Voltar não fala com o contato: nada é publicado.
+    expect(published).toHaveLength(0);
+  });
+
+  it('recusa nó sem destino escolhido, em vez de parar a conversa em silêncio', async () => {
+    const { registry } = setup();
+
+    await expect(
+      registry.get('restart_automation')(node({}), contextFor('WHATSAPP')),
+    ).rejects.toThrow(/sem o nó de destino/i);
+    await expect(
+      registry.get('restart_automation')(
+        node({ nodeClientId: '   ' }),
+        contextFor('WHATSAPP'),
+      ),
+    ).rejects.toThrow(/sem o nó de destino/i);
   });
 });
