@@ -148,6 +148,8 @@ model ChannelWebhookEvent {
   @@unique([provider, externalEventId])
   @@index([tenantId])
   @@index([status])
+  /// Disparos recebidos por canal e período, na aba de Canais.
+  @@index([tenantId, criadoEm])
   @@map("channel_webhook_events")
 }
 
@@ -247,6 +249,9 @@ model Mensagem {
 
   @@index([tenantId])
   @@index([contatoId, criadoEm])
+  /// Volume de mensagens por período no painel — o índice por contato não
+  /// serve para a contagem do tenant inteiro.
+  @@index([tenantId, criadoEm])
   @@map("mensagens")
 }
 
@@ -335,6 +340,8 @@ model Workflow {
 
   @@index([tenantId])
   /// Chave do roteamento: "qual automação ATIVA responde por esta conexão".
+  /// Contagem de automações por situação no painel de Analytics.
+  @@index([tenantId, status])
   @@index([whatsappConnectionId, status])
   @@index([instagramConnectionId, status])
   @@index([facebookConnectionId, status])
@@ -464,6 +471,10 @@ model WorkflowExecution {
 
   @@unique([workflowId, contatoId, workflowVersion])
   @@index([workflowId])
+  /// O painel de Analytics sempre lê por workflow E por janela de tempo (a
+  /// tabela não tem `tenantId`, então o escopo vem do JOIN com `workflows`).
+  /// Sem este índice, todo gráfico de período faz varredura completa.
+  @@index([workflowId, iniciadoEm])
   @@index([contatoId])
   @@index([status])
   @@map("workflow_executions")
