@@ -42,6 +42,8 @@ model Tenant {
   agentes              Agente[]
   customWebhooks       CustomWebhook[]
   mensagens            Mensagem[]
+  assinatura           Assinatura?
+  pagamentos           PagamentoMercadoPago[]
 
   @@map("tenants")
 }
@@ -733,4 +735,154 @@ model CustomWebhookDelivery {
 
   @@index([webhookId])
   @@map("custom_webhook_deliveries")
+}
+
+// ---------------------------------------------------------------------------
+// Cobrança — Mercado Pago
+// ---------------------------------------------------------------------------
+
+/// Situação de acesso do tenant à plataforma.
+///
+/// Quem decide se a API responde NÃO é este campo, e sim
+/// `Assinatura.acessoExpiraEm`: um registro pode estar marcado como ATIVA e já
+/// ter vencido entre um ciclo do poller e o próximo. O status existe para ser
+/// exibido e consultado; a data é a verdade.
+enum AssinaturaStatus {
+  /// Nunca houve pagamento aprovado — é assim que todo tenant nasce.
+  PENDENTE
+  ATIVA
+  /// Teve acesso, mas os 30 dias do último pagamento acabaram.
+  VENCIDA
+  /// Assinatura recorrente cancelada/pausada na Mercado Pago, ou pagamento
+  /// estornado. O acesso já pago não é retirado (ver `acessoExpiraEm`) — o que
+  /// deixa de acontecer é a renovação.
+  CANCELADA
+
+  @@map("assinatura_status")
+}
+
+/// Como este tenant paga.
+enum AssinaturaOrigem {
+  /// Assinatura por cartão na Mercado Pago (preapproval): a própria MP cobra
+  /// de novo a cada ciclo e dispara um webhook a cada cobrança.
+  ASSINATURA_RECORRENTE
+  /// Link de pagamento avulso: cada pagamento libera 30 dias e nada renova
+  /// sozinho — passados os 30 dias sem novo pagamento, a plataforma bloqueia.
+  LINK_PAGAMENTO
+  /// Liberado manualmente (conta interna, revisão da Meta, cortesia comercial).
+  CORTESIA
+
+  @@map("assinatura_origem")
+}
+
+/// Estado de cobrança de um tenant — exatamente um registro por tenant.
+model Assinatura {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @unique @db.Uuid
+
+  /// Plano PAGO. `Tenant.plano` é espelho deste valor (é ele que os limites
+  /// leem); aqui fica o registro de o que de fato foi cobrado.
+  plano  PlanoTipo        @default(STARTER)
+  status AssinaturaStatus @default(PENDENTE)
+  origem AssinaturaOrigem?
+
+  /// Até quando a plataforma responde para este tenant. `null` = nunca pagou.
+  /// Cada pagamento aprovado empurra esta data 30 dias para frente, a partir
+  /// do maior valor entre "agora" e a data que já estava aqui — pagar antes do
+  /// fim do ciclo soma, não desperdiça.
+  acessoExpiraEm DateTime? @db.Timestamptz()
+
+  /// E-mail usado no checkout da Mercado Pago. É por ele que um pagamento
+  /// feito num link avulso (que não carrega o id do tenant) encontra a conta.
+  payerEmail String?
+
+  /// `preapproval` da Mercado Pago, quando o plano é por assinatura recorrente.
+  mercadoPagoPreapprovalId String? @unique
+
+  ultimoPagamentoId String?
+  ultimoPagamentoEm DateTime? @db.Timestamptz()
+  canceladoEm       DateTime? @db.Timestamptz()
+
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  /// O poller de vencimento varre por data; sem índice ele faria varredura
+  /// completa a cada ciclo.
+  @@index([status, acessoExpiraEm])
+  @@map("assinaturas")
+}
+
+/// Todo pagamento que a Mercado Pago nos contou — inclusive os que não
+/// achamos dono. Guardar o não reconciliado é o que permite ligar depois, à
+/// mão, um pagamento feito com e-mail diferente do da conta.
+model PagamentoMercadoPago {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// `null` enquanto não se sabe de quem é o pagamento.
+  tenantId String? @db.Uuid
+
+  /// Id do pagamento na Mercado Pago — chave natural, e a trava que impede
+  /// que uma reentrega do webhook conceda 30 dias duas vezes.
+  mercadoPagoPaymentId String @unique
+
+  /// `approved` | `pending` | `rejected` | `refunded` | `charged_back` …
+  /// Texto puro de propósito: é vocabulário da Mercado Pago, não nosso, e
+  /// virar enum aqui só criaria migração a cada status novo que eles criem.
+  status String
+
+  origem        AssinaturaOrigem
+  valorCentavos Int
+  /// Plano identificado pelo valor cobrado. `null` quando o valor não bate com
+  /// nenhum plano do catálogo — o pagamento fica registrado, mas NÃO libera
+  /// acesso, e o log aponta a divergência.
+  plano         PlanoTipo?
+
+  payerEmail        String?
+  externalReference String?
+  preapprovalId     String?
+
+  aprovadoEm DateTime? @db.Timestamptz()
+  /// Resposta crua da API da Mercado Pago, para auditoria e para reprocessar
+  /// um pagamento sem precisar consultá-los de novo.
+  payload    Json
+  criadoEm   DateTime  @default(now()) @db.Timestamptz()
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@index([payerEmail])
+  /// A tela de reconciliação lista justamente os órfãos, mais novos primeiro.
+  @@index([tenantId, criadoEm])
+  @@map("pagamentos_mercado_pago")
+}
+
+/// Toda notificação recebida da Mercado Pago, válida ou não — mesma função do
+/// `ChannelWebhookEvent` para os canais: deduplicar reentregas e deixar
+/// trilha de quem bateu aqui.
+model MercadoPagoWebhookEvent {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// `payment` | `subscription_preapproval` | `subscription_authorized_payment` …
+  tipo String
+  /// Identidade da NOTIFICAÇÃO (o campo `id` do corpo), não do recurso: a
+  /// Mercado Pago avisa sobre o mesmo pagamento várias vezes — uma quando ele
+  /// nasce pendente, outra quando é aprovado — e cada aviso tem id próprio.
+  /// Deduplicar pelo id do pagamento faria a aprovação ser descartada como
+  /// "repetida". Sem `id` no corpo (formato IPN antigo), cai no SHA-256 do
+  /// corpo bruto.
+  externalEventId String @unique
+
+  signatureValid Boolean
+  payload        Json
+  status         WebhookEventStatus @default(RECEIVED)
+  erro           String?
+
+  criadoEm     DateTime  @default(now()) @db.Timestamptz()
+  processadoEm DateTime? @db.Timestamptz()
+
+  @@index([status])
+  @@index([criadoEm])
+  @@map("mercado_pago_webhook_events")
 }
