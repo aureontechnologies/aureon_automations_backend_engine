@@ -63,7 +63,7 @@ export class EngineTriggersConsumer {
 
     if (contato?.agenteAtivoId) {
       // Conversa sob controle de um agente — responde diretamente, sem passar pelo grafo do workflow.
-      await this.agentConversationService.respond({
+      const outcome = await this.agentConversationService.respond({
         tenantId: event.tenantId,
         contatoId: event.contatoId,
         contatoTelefone: contato.telefone,
@@ -72,6 +72,16 @@ export class EngineTriggersConsumer {
         canal: event.canal,
         connectionId: event.connectionId,
       });
+      // Esta conversa não pertence a nenhuma execução de workflow, então não há
+      // linha na tela de Execuções para registrar a falha. Sem este log, um
+      // contato que ficou sem resposta — por saldo zerado ou provedor fora do
+      // ar — não deixaria rastro em lugar nenhum.
+      if (outcome.status !== 'respondeu') {
+        this.logger.warn(
+          `Agente ${contato.agenteAtivoId} não respondeu ao contato ${event.contatoId} ` +
+            `(tenant ${event.tenantId}): ${outcome.status}.`,
+        );
+      }
       return;
     }
 

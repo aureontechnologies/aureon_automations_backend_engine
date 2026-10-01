@@ -33,9 +33,9 @@ export class TriggerAiAgentHandler {
       throw new Error('Nó "Agente IA" sem agentId configurado.');
     }
 
-    // Uma falha aqui (agente sem chave da OpenAI, OpenAI fora do ar) precisa
-    // aparecer como execução FALHADA na tela de Execuções — silenciar deixaria
-    // o contato sem resposta e o cliente sem saber por quê.
+    // Uma falha aqui (sem créditos, OpenAI fora do ar) precisa aparecer como
+    // execução FALHADA na tela de Execuções — silenciar deixaria o contato sem
+    // resposta e o cliente sem saber por quê.
     const outcome = await this.agentConversationService.respond({
       tenantId: context.tenantId,
       contatoId: context.contatoId,
@@ -46,18 +46,31 @@ export class TriggerAiAgentHandler {
       connectionId: context.connectionId,
     });
 
-    if (outcome.status === 'sem_chave_configurada') {
+    // A mensagem de cada falha é o que o cliente vai LER na tela de Execuções,
+    // então ela diz o que fazer — e "sem créditos" não pode parecer um defeito
+    // do sistema, porque não é.
+    if (outcome.status === 'sem_creditos') {
       throw new Error(
-        `Agente ${agentId} está sem chave da OpenAI configurada — não foi possível responder.`,
+        'Saldo insuficiente de créditos de IA para o Agente IA responder. ' +
+          'Adquira créditos adicionais para continuar.',
       );
     }
-    if (outcome.status === 'falha_openai') {
+    if (outcome.status === 'sem_provedor') {
+      throw new Error(
+        'O serviço de IA está indisponível no momento. Tente novamente em instantes.',
+      );
+    }
+    if (outcome.status === 'falha_provedor') {
       throw new Error(`Falha ao acionar o Agente IA: ${outcome.motivo}`);
     }
 
     return {
       kind: 'finish',
-      output: { agentId, transferidoParaHumano: outcome.transferido },
+      output: {
+        agentId,
+        transferidoParaHumano: outcome.transferido,
+        creditosConsumidos: outcome.creditosConsumidos,
+      },
     };
   }
 }

@@ -30,7 +30,7 @@ export interface InboundAttachment {
     | 'STICKER'
     | 'COMPARTILHAMENTO'
     | 'OUTRO';
-  /** Link do arquivo — Instagram e Messenger mandam assim. */
+  /** Link do arquivo, quando o canal manda a URL em vez de um id. */
   url?: string;
   /** Id da mídia na Meta — WhatsApp manda assim (baixar exige o token). */
   mediaId?: string;

@@ -13,8 +13,7 @@ type MediaTipo = (typeof TIPOS_VALIDOS)[number];
 
 /**
  * Envia imagem, vídeo ou documento. O que cada canal aceita de fato é
- * resolvido no dispatcher (o Direct do Instagram, por exemplo, não tem anexo
- * de documento e manda o link em texto) — aqui o nó só publica o pedido.
+ * resolvido no dispatcher do backend — aqui o nó só publica o pedido.
  */
 
 @Injectable()

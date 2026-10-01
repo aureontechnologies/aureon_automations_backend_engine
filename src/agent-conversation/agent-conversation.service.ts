@@ -7,8 +7,8 @@ import { MensagemRepository } from '../contatos/mensagem.repository';
 import { ChannelMessageSendEvent } from '../messaging/channel-message-send.event';
 import { RoutingKeys } from '../messaging/messaging.constants';
 import { MessagingService } from '../messaging/messaging.service';
-import { OpenAiClient, OpenAiCallError } from '../openai/openai.client';
-import { TokenCryptoService } from '../security/token-crypto.service';
+import { AI_MODELO_PADRAO } from '../ai/ai.constants';
+import { AiUsageService } from '../ai-credits/ai-usage.service';
 
 const TRANSFER_MARKER = '[TRANSFERIR_HUMANO]';
 const HISTORY_LIMIT = 20;
@@ -24,9 +24,17 @@ export interface AgentConversationInput {
 }
 
 export type AgentConversationOutcome =
-  | { status: 'respondeu'; transferido: boolean }
-  | { status: 'sem_chave_configurada' }
-  | { status: 'falha_openai'; motivo: string };
+  | { status: 'respondeu'; transferido: boolean; creditosConsumidos: number }
+  /**
+   * O tenant está sem créditos de IA. NÃO é falha de configuração nem erro de
+   * infraestrutura: é cobrança. Separado dos outros para que o handler possa
+   * dar ao cliente a mensagem certa ("compre créditos") em vez de um erro
+   * técnico que não diz o que fazer.
+   */
+  | { status: 'sem_creditos'; saldo: number; necessario: number }
+  /** A plataforma está sem chave de IA configurada — problema nosso. */
+  | { status: 'sem_provedor' }
+  | { status: 'falha_provedor'; motivo: string };
 
 /**
  * Lógica compartilhada entre a primeira ativação do agente (nó "Agente IA"
@@ -43,8 +51,7 @@ export class AgentConversationService {
     private readonly agenteRepository: AgenteRepository,
     private readonly contatoRepository: ContatoRepository,
     private readonly mensagemRepository: MensagemRepository,
-    private readonly tokenCryptoService: TokenCryptoService,
-    private readonly openAiClient: OpenAiClient,
+    private readonly aiUsageService: AiUsageService,
     private readonly messagingService: MessagingService,
   ) {}
 
@@ -53,14 +60,15 @@ export class AgentConversationService {
       input.agentId,
       input.tenantId,
     );
-    if (!agente?.openAiApiKeyEncrypted) {
-      this.logger.warn(
-        `Agente ${input.agentId} sem chave OpenAI configurada — não é possível responder.`,
-      );
-      return { status: 'sem_chave_configurada' };
+    if (!agente) {
+      // O agente foi apagado entre a publicação do workflow e a execução.
+      this.logger.warn(`Agente ${input.agentId} não encontrado no tenant ${input.tenantId}.`);
+      return {
+        status: 'falha_provedor',
+        motivo: `Agente ${input.agentId} não existe mais.`,
+      };
     }
 
-    const apiKey = this.tokenCryptoService.decrypt(agente.openAiApiKeyEncrypted);
     const historico = await this.mensagemRepository.listarHistoricoRecente(
       input.contatoId,
       HISTORY_LIMIT,
@@ -77,17 +85,32 @@ export class AgentConversationService {
         })),
     ];
 
-    let reply: string;
-    try {
-      reply = await this.openAiClient.chat(apiKey, agente.openAiModel, messages);
-    } catch (error) {
-      const motivo = error instanceof OpenAiCallError ? error.message : String(error);
-      this.logger.error(`Falha ao chamar OpenAI para o agente ${agente.id}: ${motivo}`);
-      return { status: 'falha_openai', motivo };
+    // Toda a cobrança acontece aqui dentro: verifica saldo, reserva, chama a
+    // IA, liquida pelo consumo real e estorna se falhar. Este serviço não
+    // conhece a OpenAI nem a carteira — só pede uma resposta e recebe um
+    // estado.
+    const execucao = await this.aiUsageService.executar({
+      tenantId: input.tenantId,
+      feature: 'agente_conversa',
+      model: agente.openAiModel || AI_MODELO_PADRAO,
+      messages,
+      agenteId: agente.id,
+      contatoId: input.contatoId,
+      metadata: { canal: input.canal, agenteNome: agente.nome },
+    });
+
+    if (execucao.status !== 'ok') {
+      if (execucao.status === 'sem_creditos') {
+        this.logger.warn(
+          `Tenant ${input.tenantId} sem créditos de IA: agente ${agente.id} não respondeu ao ` +
+            `contato ${input.contatoId} (saldo ${execucao.saldo}, necessário ${execucao.necessario}).`,
+        );
+      }
+      return execucao;
     }
 
-    const transferido = reply.includes(TRANSFER_MARKER);
-    const textoVisivel = reply.replace(TRANSFER_MARKER, '').trim();
+    const transferido = execucao.texto.includes(TRANSFER_MARKER);
+    const textoVisivel = execucao.texto.replace(TRANSFER_MARKER, '').trim();
 
     const event: ChannelMessageSendEvent = {
       eventId: randomUUID(),
@@ -107,15 +130,19 @@ export class AgentConversationService {
       transferido ? null : agente.id,
     );
 
-    return { status: 'respondeu', transferido };
+    return {
+      status: 'respondeu',
+      transferido,
+      creditosConsumidos: execucao.creditosConsumidos,
+    };
   }
 
   private buildSystemPrompt(instrucoes: string, canal: Canal): string {
-    const canalLabel = {
-      WHATSAPP: 'WhatsApp',
-      INSTAGRAM: 'Instagram Direct',
-      FACEBOOK: 'Facebook Messenger',
-    }[canal];
+    // Só o WhatsApp Business está no ar. O enum do banco ainda tem os canais
+    // retirados, e uma automação antiga deles pode chegar aqui: o rótulo cai
+    // no nome do canal em vez de virar `undefined` na frase do prompt.
+    const canalLabel: string =
+      { WHATSAPP: 'WhatsApp' }[canal as 'WHATSAPP'] ?? canal;
 
     // O histórico é texto: o que o contato manda sem ser texto chega descrito
     // entre colchetes (ver `inbound-message.util.ts` no backend). Dizer isso

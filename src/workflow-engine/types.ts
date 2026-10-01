@@ -62,7 +62,7 @@ export interface NodeExecutionContext {
   executionId: string;
   /** `WorkflowExecutionNode.id` do nó sendo executado agora — usado como chave de idempotência dos eventos de envio publicados por este nó. */
   executionNodeId: string;
-  /** Conexão (WhatsAppConnection/InstagramConnection/FacebookConnection) resolvida do nó-gatilho publicado — usada por todo nó de envio deste fluxo. */
+  /** Conexão (`WhatsAppConnection`) resolvida do nó-gatilho publicado — usada por todo nó de envio deste fluxo. */
   connectionId: string;
   /** A mensagem que originou esta rodada: a do disparo inicial ou a resposta que resolveu uma espera. Ausente quando a rodada foi retomada por timeout. */
   incoming?: IncomingMessage;

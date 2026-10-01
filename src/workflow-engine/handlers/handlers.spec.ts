@@ -14,17 +14,14 @@ import { TriggerAiAgentHandler } from './trigger-ai-agent.handler';
 import { WaitForReplyHandler } from './wait-for-reply.handler';
 
 /**
- * Um teste por NÓ do catálogo, nos três canais: o que cada um publica para o
- * dispatcher e quando ele recusa uma configuração impossível de executar.
+ * Um teste por NÓ do catálogo: o que cada um publica para o dispatcher e
+ * quando ele recusa uma configuração impossível de executar.
  */
 
-const CANAIS = ['WHATSAPP', 'INSTAGRAM', 'FACEBOOK'] as const;
+const CANAIS = ['WHATSAPP'] as const;
 
-/** O contato tem prefixo por canal no banco — `ig:`/`fb:`. */
 const CONTATO_POR_CANAL = {
   WHATSAPP: '5511999990000',
-  INSTAGRAM: 'ig:IGSID-77',
-  FACEBOOK: 'fb:PSID-77',
 } as const;
 
 function contextFor(canal: (typeof CANAIS)[number]): NodeExecutionContext {
@@ -53,7 +50,11 @@ function setup() {
     ),
   };
   const agentConversation = {
-    respond: jest.fn().mockResolvedValue({ status: 'respondeu', transferido: false }),
+    respond: jest.fn().mockResolvedValue({
+      status: 'respondeu',
+      transferido: false,
+      creditosConsumidos: 1200,
+    }),
   };
   const registry = new NodeExecutorRegistry();
   new SendTextMessageHandler(registry, messaging as never);
@@ -150,7 +151,7 @@ describe('Nó "Mensagem com Botões" (send_buttons_message)', () => {
     await expect(
       registry.get('send_buttons_message')(
         node({ texto: 'Olá', botoes: [] }),
-        contextFor('INSTAGRAM'),
+        contextFor('WHATSAPP'),
       ),
     ).rejects.toThrow(/sem nenhum botão/i);
   });
@@ -195,7 +196,7 @@ describe('Nó "Aguardar Resposta" (wait_for_reply)', () => {
     const { registry } = setup();
     const result = await registry.get('wait_for_reply')(
       node({ timeoutMinutos: 5 }),
-      contextFor('FACEBOOK'),
+      contextFor('WHATSAPP'),
     );
     expect(result.kind).toBe('suspend');
     if (result.kind === 'suspend') {
@@ -217,7 +218,7 @@ describe('Nó "Contato respondeu?" (if_contact_replied)', () => {
   it('segue por "sim" quando a espera terminou com resposta', async () => {
     const { registry } = setup();
     const result = await registry.get('if_contact_replied')(node({}), {
-      ...contextFor('INSTAGRAM'),
+      ...contextFor('WHATSAPP'),
       waitResolution: 'REPLY',
     });
     expect(result).toEqual({ kind: 'ok', branch: 'sim', output: { respondeu: true } });
@@ -226,7 +227,7 @@ describe('Nó "Contato respondeu?" (if_contact_replied)', () => {
   it('segue por "nao" quando o prazo esgotou', async () => {
     const { registry } = setup();
     const result = await registry.get('if_contact_replied')(node({}), {
-      ...contextFor('INSTAGRAM'),
+      ...contextFor('WHATSAPP'),
       waitResolution: 'TIMEOUT',
     });
     expect(result).toEqual({ kind: 'ok', branch: 'nao', output: { respondeu: false } });
@@ -252,13 +253,21 @@ describe('Nó "Agente IA" (trigger_ai_agent)', () => {
     );
     expect(result).toEqual({
       kind: 'finish',
-      output: { agentId: 'agente-1', transferidoParaHumano: false },
+      output: {
+        agentId: 'agente-1',
+        transferidoParaHumano: false,
+        creditosConsumidos: 1200,
+      },
     });
   });
 
   it('agente que pede transferência para humano fica registrado no histórico do nó', async () => {
     const { registry, agentConversation } = setup();
-    agentConversation.respond.mockResolvedValue({ status: 'respondeu', transferido: true });
+    agentConversation.respond.mockResolvedValue({
+      status: 'respondeu',
+      transferido: true,
+      creditosConsumidos: 800,
+    });
 
     const result = await registry.get('trigger_ai_agent')(
       node({ agentId: 'agente-1' }),
@@ -267,25 +276,51 @@ describe('Nó "Agente IA" (trigger_ai_agent)', () => {
 
     expect(result).toEqual({
       kind: 'finish',
-      output: { agentId: 'agente-1', transferidoParaHumano: true },
+      output: {
+        agentId: 'agente-1',
+        transferidoParaHumano: true,
+        creditosConsumidos: 800,
+      },
     });
   });
 
-  it('sem agentId, sem chave da OpenAI ou com a OpenAI falhando, a execução falha', async () => {
+  it('sem agentId ou com o provedor de IA falhando, a execução falha', async () => {
     const { registry, agentConversation } = setup();
     await expect(
       registry.get('trigger_ai_agent')(node({}), contextFor('WHATSAPP')),
     ).rejects.toThrow(/sem agentId/i);
 
-    agentConversation.respond.mockResolvedValue({ status: 'sem_chave_configurada' });
+    agentConversation.respond.mockResolvedValue({ status: 'sem_provedor' });
     await expect(
       registry.get('trigger_ai_agent')(node({ agentId: 'a' }), contextFor('WHATSAPP')),
-    ).rejects.toThrow(/chave da OpenAI/i);
+    ).rejects.toThrow(/indisponível/i);
 
-    agentConversation.respond.mockResolvedValue({ status: 'falha_openai', motivo: 'HTTP 429' });
+    agentConversation.respond.mockResolvedValue({
+      status: 'falha_provedor',
+      motivo: 'HTTP 429',
+    });
     await expect(
       registry.get('trigger_ai_agent')(node({ agentId: 'a' }), contextFor('WHATSAPP')),
     ).rejects.toThrow(/HTTP 429/);
+  });
+
+  /**
+   * Saldo zerado é cobrança, não defeito — e a execução precisa falhar MESMO
+   * ASSIM: se ela terminasse com sucesso, o contato ficaria sem resposta e o
+   * cliente veria um workflow "verde" que não atendeu ninguém. O que muda é a
+   * mensagem, que diz o que fazer em vez de descrever um erro técnico.
+   */
+  it('sem créditos de IA, a execução falha dizendo para comprar créditos', async () => {
+    const { registry, agentConversation } = setup();
+    agentConversation.respond.mockResolvedValue({
+      status: 'sem_creditos',
+      saldo: 12,
+      necessario: 200,
+    });
+
+    await expect(
+      registry.get('trigger_ai_agent')(node({ agentId: 'a' }), contextFor('WHATSAPP')),
+    ).rejects.toThrow(/créditos adicionais/i);
   });
 });
 

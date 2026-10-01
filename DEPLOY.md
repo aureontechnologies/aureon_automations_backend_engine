@@ -93,10 +93,20 @@ RABBITMQ_URL = ${{RabbitMQ.RABBITMQ_URL}}
 | `DATABASE_URL` | ✅ | **mesma** do serviço backend |
 | `RABBITMQ_URL` | ✅ | **mesma** do serviço backend |
 | `ENCRYPTION_KEY` | ✅ | **idêntica** à do serviço backend |
+| `OPENAI_API_KEY` | ✅ | chave da **plataforma**, **idêntica** à do serviço backend. Sem ela, nenhum agente publicado responde a contato nenhum |
+| `AI_PROVIDER` | — | vazio = `openai` |
+| `OPENAI_BASE_URL` | — | endpoint compatível (Azure OpenAI, gateway próprio); vazio = `https://api.openai.com/v1` |
+| `AI_CREDIT_TOKEN_RATIO` | — | créditos por token; vazio = 1. **Idêntico** ao do serviço backend |
+| `AI_CREDIT_RESERVA_MINIMA` | — | reserva mínima por chamada; vazio = 200. **Idêntica** à do serviço backend |
 
-É a lista inteira. Este serviço não fala com a Meta e não tem chave própria de
-OpenAI — a chave de cada nó de IA vem do banco, por agente, cifrada com
-`ENCRYPTION_KEY`.
+É a lista inteira. Este serviço não fala com a Meta.
+
+As variáveis de IA **têm que bater** com as do serviço backend: os dois chamam
+o provedor com a MESMA chave da plataforma e descontam da MESMA carteira de
+créditos. Uma conversão diferente em cada um faria a mesma conversa custar
+valores diferentes dependendo de quem a atendeu — e uma chave ausente aqui faz
+os agentes pararem de responder em silêncio para o cliente (com log alto deste
+lado, mas sem nada na tela dele além de uma execução falhada).
 
 ---
 
@@ -134,8 +144,8 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 
 ## Nós que o motor executa
 
-Um por tipo do catálogo (`prisma/seed.ts` no backend), nos três canais —
-WhatsApp, Instagram Direct e Facebook Messenger. O motor nunca fala com a Meta:
+Um por tipo do catálogo (`prisma/seed.ts` no backend). O motor nunca fala com
+a Meta:
 ele publica o pedido em `channel.message.send`, e o backend (dispatcher)
 resolve a credencial da conexão e chama a API do canal.
 

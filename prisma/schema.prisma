@@ -44,6 +44,10 @@ model Tenant {
   mensagens            Mensagem[]
   assinatura           Assinatura?
   pagamentos           PagamentoMercadoPago[]
+  aiCreditWallet       AiCreditWallet?
+  aiCreditTransactions AiCreditTransaction[]
+  aiCreditPurchases    AiCreditPurchase[]
+  aiUsages             AiUsage[]
 
   @@map("tenants")
 }
@@ -580,10 +584,19 @@ model Agente {
   horarioFim           String?
   transferirParaHumano Boolean @default(true)
 
-  /// Envelope AES-256-GCM (mesmo formato do WhatsAppConnection.accessTokenEncrypted)
-  /// — cada agente usa a própria chave OpenAI, cadastrada e gerida pelo
-  /// próprio usuário no painel da OpenAI; nunca retornada em texto puro.
+  /// Envelope AES-256-GCM (mesmo formato do WhatsAppConnection.accessTokenEncrypted).
+  ///
+  /// NÃO é mais o caminho normal: a IA passou a ser paga em créditos, com a
+  /// chave da PLATAFORMA (`OPENAI_API_KEY`, só no backend). Esta coluna é a
+  /// costura do BYOK — "traga sua própria chave" — que um plano poderá
+  /// liberar no futuro (ver `PlanDefinition.aiByokPermitido`). Continua aqui,
+  /// e não foi derrubada, porque apagar a coluna destruiria as chaves que os
+  /// clientes já cadastraram, e o BYOK está previsto, não descartado.
+  /// Nunca retornada em texto puro.
   openAiApiKeyEncrypted String?
+  /// Modelo usado nas chamadas deste agente. O padrão vem de
+  /// `AI_DEFAULT_MODEL`; o valor guardado aqui vence, para que um agente
+  /// afinado num modelo específico não mude de comportamento num deploy.
   openAiModel           String  @default("gpt-4o-mini")
 
   status AgenteStatus @default(RASCUNHO)
@@ -885,4 +898,266 @@ model MercadoPagoWebhookEvent {
   @@index([status])
   @@index([criadoEm])
   @@map("mercado_pago_webhook_events")
+}
+
+// ---------------------------------------------------------------------------
+// Créditos de IA
+//
+// O cliente não traz mais chave da OpenAI: ele compra CAPACIDADE de IA da
+// plataforma, medida em créditos. A chave (e o custo real do provedor) são da
+// plataforma e nunca saem do backend.
+//
+// O crédito é uma unidade INTERNA. A relação entre tokens do provedor e
+// créditos é configuração (`AI_CREDIT_TOKEN_RATIO`), não schema — mudar a
+// conversão não pode exigir migração nem reescrever histórico.
+// ---------------------------------------------------------------------------
+
+/// De onde veio um crédito. Existe separado do saldo total porque as duas
+/// origens têm regras de vida diferentes: o crédito do plano é renovado (e
+/// zerado) a cada ciclo pago; o comprado foi pago à parte e sobrevive ao ciclo.
+enum AiCreditOrigem {
+  /// Concedido pela assinatura — expira quando o ciclo seguinte concede de novo.
+  PLANO
+  /// Pacote avulso comprado pelo cliente — não expira na virada do ciclo.
+  COMPRADO
+
+  @@map("ai_credit_origem")
+}
+
+/// Toda alteração de saldo tem um destes. O saldo NUNCA muda sem uma linha em
+/// `ai_credit_transactions` — é essa regra que torna a carteira auditável.
+enum AiCreditTransactionType {
+  /// Créditos incluídos no plano, concedidos na ativação/renovação.
+  CONCESSAO_PLANO
+  /// Pacote adicional, creditado só após pagamento confirmado pelo webhook.
+  COMPRA
+  /// Reserva feita antes de chamar o provedor de IA (débito).
+  CONSUMO
+  /// Devolução do que foi reservado e não consumido, ou da chamada que falhou.
+  ESTORNO
+  /// Créditos do plano zerados na virada do ciclo.
+  EXPIRACAO
+  /// Acerto manual da operação, ou o excedente quando o consumo real passou da
+  /// reserva.
+  AJUSTE
+
+  @@map("ai_credit_transaction_type")
+}
+
+/// Ciclo de vida de uma chamada de IA. RESERVADO é estado transitório: toda
+/// chamada termina CONSUMIDO (deu certo) ou ESTORNADO (falhou).
+enum AiUsageStatus {
+  RESERVADO
+  CONSUMIDO
+  ESTORNADO
+
+  @@map("ai_usage_status")
+}
+
+enum AiCreditPurchaseStatus {
+  /// Checkout criado, dinheiro não confirmado. NÃO credita nada.
+  PENDENTE
+  /// Webhook confirmou o pagamento e os créditos entraram na carteira.
+  PAGA
+  /// Recusada, expirada ou estornada.
+  CANCELADA
+
+  @@map("ai_credit_purchase_status")
+}
+
+/// Carteira de créditos de IA — exatamente uma por tenant.
+///
+/// O saldo é guardado em DOIS potes em vez de um número só. Sem a separação
+/// não há como zerar o crédito do plano na virada do ciclo sem levar junto o
+/// pacote que o cliente pagou à parte.
+///
+/// `reservado` é o que está em voo: créditos já debitados dos potes para uma
+/// chamada que ainda não voltou. Ele existe para que o saldo exibido nunca
+/// prometa capacidade que outra requisição já tomou.
+model AiCreditWallet {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @unique @db.Uuid
+
+  /// Concedido pela assinatura. Zerado e reconcedido a cada ciclo pago.
+  saldoPlano    Int @default(0)
+  /// Comprado em pacote avulso. Atravessa a virada do ciclo.
+  saldoComprado Int @default(0)
+  /// Debitado dos potes acima e ainda não liquidado (chamadas em voo).
+  reservado     Int @default(0)
+
+  /// Acumuladores de vida inteira, para o painel e para relatório financeiro.
+  /// São somas do histórico, nunca a fonte do saldo.
+  totalConcedido Int @default(0)
+  totalComprado  Int @default(0)
+  totalConsumido Int @default(0)
+
+  /// Qual concessão de plano já foi aplicada. É a trava de idempotência: a
+  /// reentrega de um webhook de pagamento não pode conceder o pacote mensal
+  /// duas vezes.
+  ultimaConcessaoRef String?
+  ultimaConcessaoEm  DateTime? @db.Timestamptz()
+
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("ai_credit_wallets")
+}
+
+/// Livro-razão da carteira. Imutável por natureza: nada aqui é atualizado ou
+/// apagado — um erro se corrige com uma transação de AJUSTE, nunca reescrevendo
+/// a linha errada.
+model AiCreditTransaction {
+  id        String  @id @default(uuid()) @db.Uuid
+  tenantId  String  @db.Uuid
+  /// Quem disparou. `null` no que é da máquina: concessão de plano, expiração
+  /// de ciclo, crédito vindo de webhook.
+  usuarioId String? @db.Uuid
+
+  tipo   AiCreditTransactionType
+  /// De qual pote saiu/entrou. `null` quando a movimentação tocou os dois.
+  origem AiCreditOrigem?
+
+  /// Positivo credita, negativo debita. Nunca zero.
+  quantidade  Int
+  /// Saldo total (plano + comprado) imediatamente antes e depois. Guardado, e
+  /// não recalculado: é o que permite auditar a carteira sem depender de
+  /// reprocessar o histórico inteiro na ordem certa.
+  saldoAntes  Int
+  saldoDepois Int
+
+  descricao String
+  /// O que originou a movimentação, conforme o tipo: id do `AiUsage`, do
+  /// `AiCreditPurchase`, do pagamento na Mercado Pago, ou da concessão.
+  referenciaId String?
+  metadata     Json?
+
+  criadoEm DateTime @default(now()) @db.Timestamptz()
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  /// O extrato é sempre "deste tenant, do mais novo para o mais velho".
+  @@index([tenantId, criadoEm])
+  @@index([referenciaId])
+  @@map("ai_credit_transactions")
+}
+
+/// Uma chamada ao provedor de IA: o que foi pedido, quantos tokens custou e
+/// quantos créditos isso virou.
+///
+/// Esta tabela é a resposta para "quem consumiu, em quê, com qual modelo" — e
+/// a única fonte do relatório de margem, já que guarda os tokens REAIS ao lado
+/// dos créditos cobrados.
+model AiUsage {
+  id        String  @id @default(uuid()) @db.Uuid
+  tenantId  String  @db.Uuid
+  /// `null` quando quem consumiu foi o motor (workflow/agente respondendo um
+  /// contato), não uma pessoa numa tela.
+  usuarioId String? @db.Uuid
+
+  /// `openai` | `anthropic` | `gemini` … — texto puro porque é vocabulário de
+  /// terceiros e virar enum obrigaria a migrar a cada provedor novo.
+  provider String
+  model    String
+  /// Que parte do produto gastou: `agente_teste`, `agente_conversa`, …
+  feature  String
+
+  status AiUsageStatus @default(RESERVADO)
+
+  /// Uso REAL informado pelo provedor. Fica zerado enquanto a chamada não volta.
+  promptTokens     Int @default(0)
+  completionTokens Int @default(0)
+  totalTokens      Int @default(0)
+
+  /// Debitado ANTES da chamada, pela estimativa.
+  creditosReservados Int
+  /// Debitado de fato depois da liquidação. `0` em chamada estornada.
+  creditosConsumidos Int @default(0)
+
+  /// Idempotência da liquidação: uma mesma chamada não pode ser cobrada duas
+  /// vezes, mesmo se o handler for reexecutado.
+  requestId String @unique
+
+  agenteId            String? @db.Uuid
+  contatoId           String? @db.Uuid
+  workflowExecutionId String? @db.Uuid
+  /// Motivo do estorno, quando houve.
+  erro                String?
+  metadata            Json?
+
+  criadoEm     DateTime  @default(now()) @db.Timestamptz()
+  finalizadoEm DateTime? @db.Timestamptz()
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, criadoEm])
+  @@index([tenantId, status])
+  @@index([agenteId])
+  @@map("ai_usages")
+}
+
+/// Pacote de créditos à venda. Editável pela operação sem deploy — ao
+/// contrário do catálogo de planos, que é código porque governa LIMITES, aqui
+/// só há preço e quantidade.
+model AiCreditPackage {
+  id            String  @id @default(uuid()) @db.Uuid
+  nome          String
+  creditos      Int
+  /// Em centavos, para não carregar ponto flutuante em dinheiro.
+  precoCentavos Int
+  ativo         Boolean @default(true)
+  /// Ordem de exibição na vitrine.
+  ordem         Int     @default(0)
+
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  compras AiCreditPurchase[]
+
+  @@index([ativo, ordem])
+  @@map("ai_credit_packages")
+}
+
+/// Uma intenção de compra de pacote.
+///
+/// Nasce PENDENTE junto com o checkout e só vira PAGA pelo webhook do gateway.
+/// Existir antes do pagamento é o que permite reconhecer, na volta, QUAL
+/// pacote foi comprado e por qual tenant — sem depender do valor pago nem da
+/// palavra do frontend.
+model AiCreditPurchase {
+  id        String @id @default(uuid()) @db.Uuid
+  tenantId  String @db.Uuid
+  packageId String @db.Uuid
+
+  /// Copiados do pacote no momento da compra: mudar o preço do pacote amanhã
+  /// não pode reescrever o que já foi vendido.
+  creditos      Int
+  precoCentavos Int
+
+  status AiCreditPurchaseStatus @default(PENDENTE)
+
+  /// Viaja no `external_reference` da preferência e volta no webhook — é por
+  /// ele que o pagamento reencontra ESTA compra, em vez de ser adivinhado pelo
+  /// valor, como acontece com os links estáticos de assinatura.
+  externalReference       String  @unique
+  mercadoPagoPreferenceId String? @unique
+  /// Preenchido na confirmação. Unique: é a trava que impede uma reentrega do
+  /// webhook de creditar o mesmo pacote duas vezes.
+  mercadoPagoPaymentId    String? @unique
+  checkoutUrl             String?
+
+  creditadoEm DateTime? @db.Timestamptz()
+  /// Por que foi cancelada, quando foi.
+  motivo      String?
+
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  pacote AiCreditPackage @relation(fields: [packageId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, criadoEm])
+  @@index([status])
+  @@map("ai_credit_purchases")
 }

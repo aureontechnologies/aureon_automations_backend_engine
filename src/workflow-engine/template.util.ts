@@ -1,10 +1,11 @@
 import { NodeExecutionContext } from './types';
 
 /**
- * Prefixos que o identificador do contato leva no banco por canal (`ig:` no
- * Instagram, `fb:` no Messenger) para nunca colidir com um número de WhatsApp.
- * São detalhe interno: numa mensagem para o contato, `{{telefone}}` mostra o
- * número no WhatsApp e o identificador limpo nos outros canais.
+ * Prefixos que o identificador do contato leva no banco quando não é um número
+ * de telefone, para nunca colidir com um do WhatsApp. Os canais que os usavam
+ * saíram do ar, mas os CONTATOS gravados por eles continuam no banco — tirar
+ * esta limpeza faria `{{telefone}}` desses contatos aparecer com o prefixo
+ * cru numa mensagem.
  */
 const CONTACT_PREFIXES = ['ig:', 'fb:'];
 
