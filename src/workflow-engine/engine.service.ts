@@ -335,7 +335,14 @@ export class WorkflowEngineService {
         // Nó não-ramificado: o caminho seguinte já é conhecido, enfileira antes de suspender.
         queue.push(...this.successorNodeIds(nodeId, edgesBySource));
       }
-      await this.persistWait(executionId, claim.executionNodeId, result.resumeAt, queue, visited);
+      await this.persistWait(
+        executionId,
+        claim.executionNodeId,
+        result.resumeAt,
+        queue,
+        visited,
+        result.aceitaResposta ?? true,
+      );
       await this.prisma.workflowExecution.update({
         where: { id: executionId },
         data: { status: 'WAITING' },
@@ -435,9 +442,11 @@ export class WorkflowEngineService {
     resumeAt: Date,
     pendingQueue: string[],
     visited: Set<string>,
+    aceitaResposta: boolean,
   ): Promise<void> {
     const data = {
       executionNodeId,
+      aceitaResposta,
       resumeAt,
       pendingQueue: pendingQueue as unknown as Prisma.InputJsonValue,
       visitedNodeIds: [...visited] as unknown as Prisma.InputJsonValue,

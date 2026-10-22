@@ -94,6 +94,8 @@ export type NodeExecutionResult =
       motivo: string;
       output?: Record<string, unknown>;
       publicarAposEspera?: { routingKey: string; event: Record<string, unknown> };
+      /** `false` = espera só de tempo; mensagem do contato não a resolve. Padrão: true. */
+      aceitaResposta?: boolean;
     }
   | { kind: 'finish'; output?: Record<string, unknown> }
   /**

@@ -25,6 +25,8 @@ export class WaitResolverService {
         FROM workflow_execution_waits w
         JOIN workflow_executions e ON e.id = w."executionId"
         WHERE e."contatoId" = ${contatoId}::uuid AND w."resolvedAt" IS NULL
+          -- "Atraso inteligente" espera só o tempo: resposta não o adianta.
+          AND w."aceitaResposta" = true
         ORDER BY w."criadoEm" DESC
         LIMIT 1
         FOR UPDATE OF w SKIP LOCKED

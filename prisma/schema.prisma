@@ -48,8 +48,29 @@ model Tenant {
   aiCreditTransactions AiCreditTransaction[]
   aiCreditPurchases    AiCreditPurchase[]
   aiUsages             AiUsage[]
+  equipes              Equipe[]
+  etiquetas            Etiqueta[]
+  conversas            Conversa[]
+  conversaEventos      ConversaEvento[]
+  mensagemTemplates    MensagemTemplate[]
+  agendamentos         Agendamento[]
+  kanbanQuadros        KanbanQuadro[]
+  notificacoes         Notificacao[]
 
   @@map("tenants")
+}
+
+/// Papel do usuário DENTRO do tenant.
+///
+/// O cadastro público cria sempre o DONO; membros são criados por ele (ou por
+/// um ADMIN) na tela de Equipe. DONO e ADMIN enxergam tudo; o MEMBRO só os
+/// módulos listados em `Usuario.permissoes` — ver `permissoes.constants.ts`.
+enum UsuarioPapel {
+  DONO
+  ADMIN
+  MEMBRO
+
+  @@map("usuario_papel")
 }
 
 model Usuario {
@@ -60,11 +81,91 @@ model Usuario {
   tenantId  String   @db.Uuid
   criadoEm  DateTime @default(now()) @db.Timestamptz()
 
-  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  refreshTokens RefreshToken[]
+  /// `DONO` de propósito como padrão: todo usuário que já existia foi criado
+  /// pelo cadastro público, e é o dono da própria conta.
+  papel                 UsuarioPapel @default(DONO)
+  /// Chaves dos módulos liberados ao MEMBRO. Ignorado para DONO e ADMIN.
+  permissoes            Json         @default("[]")
+  /// Membro desativado não entra nem recebe atendimentos — a linha fica para
+  /// não apagar o histórico de quem atendeu o quê.
+  ativo                 Boolean      @default(true)
+  /// "Disponível para novos atendimentos" — entra no rodízio de atribuição.
+  disponivelAtendimento Boolean      @default(true)
+  cargo                 String?
+
+  tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  refreshTokens       RefreshToken[]
+  equipes             EquipeMembro[]
+  conversasAtribuidas Conversa[]
+  mensagensEnviadas   Mensagem[]
+  conversaEventos     ConversaEvento[]
+  agendamentos        Agendamento[]        @relation("AgendamentoResponsavel")
+  agendamentosCriados Agendamento[]        @relation("AgendamentoCriador")
+  kanbanCartoes       KanbanCartaoMembro[]
+  notificacoes        Notificacao[]
 
   @@index([tenantId])
   @@map("usuarios")
+}
+
+// ---------------------------------------------------------------------------
+// Equipes
+// ---------------------------------------------------------------------------
+
+/// Agrupamento de membros (Comercial, Suporte…). Um membro pode estar em mais
+/// de uma equipe; a equipe serve para organizar e para transferir atendimentos.
+model Equipe {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @db.Uuid
+  nome         String
+  descricao    String?
+  cor          String?
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant  Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  membros EquipeMembro[]
+
+  @@unique([tenantId, nome])
+  @@index([tenantId])
+  @@map("equipes")
+}
+
+model EquipeMembro {
+  equipeId  String   @db.Uuid
+  usuarioId String   @db.Uuid
+  criadoEm  DateTime @default(now()) @db.Timestamptz()
+
+  equipe  Equipe  @relation(fields: [equipeId], references: [id], onDelete: Cascade)
+  usuario Usuario @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  @@id([equipeId, usuarioId])
+  @@index([usuarioId])
+  @@map("equipe_membros")
+}
+
+// ---------------------------------------------------------------------------
+// Notificações internas (sino da barra superior)
+// ---------------------------------------------------------------------------
+
+model Notificacao {
+  id        String    @id @default(uuid()) @db.Uuid
+  tenantId  String    @db.Uuid
+  usuarioId String    @db.Uuid
+  /// `AUTOMACAO` | `ATENDIMENTO` | `AGENDA` | `KANBAN` — texto livre, só para ícone.
+  tipo      String
+  titulo    String
+  mensagem  String?
+  /// Rota da web para onde o clique leva (ex.: `/atendimento?conversa=<id>`).
+  link      String?
+  lidaEm    DateTime? @db.Timestamptz()
+  criadoEm  DateTime  @default(now()) @db.Timestamptz()
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  usuario Usuario @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  @@index([usuarioId, lidaEm, criadoEm])
+  @@map("notificacoes")
 }
 
 model RefreshToken {
@@ -114,9 +215,10 @@ model WhatsAppConnection {
   criadoEm     DateTime                 @default(now()) @db.Timestamptz()
   atualizadoEm DateTime                 @updatedAt @db.Timestamptz()
 
-  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  conversas Conversa[]
-  workflows Workflow[]
+  tenant            Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversas         Conversa[]
+  workflows         Workflow[]
+  mensagemTemplates MensagemTemplate[]
 
   /// phoneNumberId da Meta é globalmente único — impede que um número
   /// migrado entre tenants sem limpeza cause roteamento cruzado de webhooks.
@@ -185,16 +287,63 @@ model Contato {
   agenteAtivoId    String?   @db.Uuid
   agenteAtivoDesde DateTime? @db.Timestamptz()
 
+  /// Dados de CRM — editáveis na tela de Contatos, no painel do atendimento e
+  /// pela ação "Definir campo" das automações (ver `CAMPOS_CONTATO`).
+  email        String?
+  observacoes  String?
+  valor        Decimal  @default(0) @db.Decimal(12, 2)
+  /// 0 a 5 estrelas.
+  rating       Int      @default(0)
+  atualizadoEm DateTime @default(now()) @updatedAt @db.Timestamptz()
+
   tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   agenteAtivo        Agente?             @relation(fields: [agenteAtivoId], references: [id], onDelete: SetNull)
   conversas          Conversa[]
   workflowExecutions WorkflowExecution[]
   mensagens          Mensagem[]
+  etiquetas          ContatoEtiqueta[]
+  eventos            ConversaEvento[]
+  agendamentos       Agendamento[]
+  kanbanCartoes      KanbanCartao[]
 
   @@unique([tenantId, telefone])
   @@index([tenantId])
   @@index([agenteAtivoId])
+  @@index([tenantId, criadoEm])
   @@map("contatos")
+}
+
+/// Etiqueta livre do CRM. Diferente do sistema de referência (etiqueta única
+/// por contato, presa a um grupo), aqui o contato pode ter quantas quiser —
+/// como no BotConversa — e a etiqueta é criada pelo próprio usuário.
+model Etiqueta {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @db.Uuid
+  nome         String
+  /// Hex (`#F5B800`). Só apresentação.
+  cor          String   @default("#F5B800")
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant   Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contatos ContatoEtiqueta[]
+
+  @@unique([tenantId, nome])
+  @@index([tenantId])
+  @@map("etiquetas")
+}
+
+model ContatoEtiqueta {
+  contatoId  String   @db.Uuid
+  etiquetaId String   @db.Uuid
+  criadoEm   DateTime @default(now()) @db.Timestamptz()
+
+  contato  Contato  @relation(fields: [contatoId], references: [id], onDelete: Cascade)
+  etiqueta Etiqueta @relation(fields: [etiquetaId], references: [id], onDelete: Cascade)
+
+  @@id([contatoId, etiquetaId])
+  @@index([etiquetaId])
+  @@map("contato_etiquetas")
 }
 
 enum MensagemDirecao {
@@ -225,8 +374,23 @@ enum MensagemTipo {
   COMPARTILHAMENTO
   STORY
   NAO_SUPORTADO
+  /// Modelo de mensagem aprovado pela Meta — o único envio permitido com a
+  /// janela de 24h fechada.
+  TEMPLATE
 
   @@map("mensagem_tipo")
+}
+
+/// Situação de entrega de uma mensagem ENVIADA, vinda dos `statuses` do
+/// webhook da Meta. Nula nas mensagens recebidas.
+enum MensagemStatusEnvio {
+  PENDENTE
+  ENVIADA
+  ENTREGUE
+  LIDA
+  FALHOU
+
+  @@map("mensagem_status_envio")
 }
 
 /// Histórico normalizado de mensagens trocadas com um contato, através de
@@ -250,31 +414,322 @@ model Mensagem {
   metadata  Json?
   criadoEm  DateTime        @default(now()) @db.Timestamptz()
 
-  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  contato Contato @relation(fields: [contatoId], references: [id], onDelete: Cascade)
+  /// Conversa do atendimento a que a mensagem pertence. Nula nas mensagens
+  /// gravadas antes do atendimento existir — a tela as encontra pelo contato.
+  conversaId  String?              @db.Uuid
+  /// Id da mensagem na Meta (`wamid.…`) — é por ele que os `statuses` do
+  /// webhook (entregue, lida) encontram a mensagem.
+  wamid       String?              @unique
+  statusEnvio MensagemStatusEnvio?
+  erroEnvio   String?
+  /// Membro que enviou pelo atendimento. Nulo quando quem enviou foi a
+  /// automação, o Agente IA, ou quando a mensagem é do contato.
+  usuarioId   String?              @db.Uuid
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contato  Contato   @relation(fields: [contatoId], references: [id], onDelete: Cascade)
+  conversa Conversa? @relation(fields: [conversaId], references: [id], onDelete: SetNull)
+  usuario  Usuario?  @relation(fields: [usuarioId], references: [id], onDelete: SetNull)
 
   @@index([tenantId])
   @@index([contatoId, criadoEm])
   /// Volume de mensagens por período no painel — o índice por contato não
   /// serve para a contagem do tenant inteiro.
   @@index([tenantId, criadoEm])
+  @@index([conversaId, criadoEm])
   @@map("mensagens")
 }
 
+/// Conversa do ATENDIMENTO (bate-papo ao vivo): um contato falando com UM
+/// número conectado. É a linha que a lista do atendimento ordena, filtra e
+/// atribui — as mensagens continuam em `Mensagem`.
+///
+/// Status: `ATIVA` = aberta, `FINALIZADA` = fechada. `AGUARDANDO_RESPOSTA`
+/// existe desde o início do schema e não é usado pelo atendimento.
 model Conversa {
   id                   String         @id @default(uuid()) @db.Uuid
+  tenantId             String         @db.Uuid
   contatoId            String         @db.Uuid
   whatsappConnectionId String         @db.Uuid
   status               ConversaStatus @default(ATIVA)
-  criadoEm             DateTime       @default(now()) @db.Timestamptz()
-  atualizadoEm         DateTime       @updatedAt @db.Timestamptz()
 
+  /// Membro responsável. Nulo = "não atribuída".
+  atribuidoAId          String?          @db.Uuid
+  naoLidas              Int              @default(0)
+  ultimaMensagemEm      DateTime?        @db.Timestamptz()
+  ultimaMensagemPreview String?
+  ultimaMensagemDirecao MensagemDirecao?
+  /// Última mensagem DO CONTATO. A janela de atendimento de 24h da Meta conta
+  /// a partir daqui: fora dela, só modelo de mensagem aprovado pode ser enviado.
+  ultimaEntradaEm       DateTime?        @db.Timestamptz()
+  finalizadaEm          DateTime?        @db.Timestamptz()
+
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant             Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   contato            Contato            @relation(fields: [contatoId], references: [id], onDelete: Cascade)
   whatsappConnection WhatsAppConnection @relation(fields: [whatsappConnectionId], references: [id], onDelete: Cascade)
+  atribuidoA         Usuario?           @relation(fields: [atribuidoAId], references: [id], onDelete: SetNull)
+  mensagens          Mensagem[]
+  eventos            ConversaEvento[]
 
+  @@unique([contatoId, whatsappConnectionId])
   @@index([contatoId])
   @@index([whatsappConnectionId])
+  /// A lista do atendimento: "abertas deste tenant, mais recentes primeiro".
+  @@index([tenantId, status, ultimaMensagemEm])
+  @@index([tenantId, atribuidoAId])
   @@map("conversas")
+}
+
+/// O que aconteceu na conversa além das mensagens — etiqueta adicionada,
+/// transferência, finalização, agendamento criado… É a linha tracejada no
+/// meio do chat, igual ao sistema de referência.
+///
+/// Tabela própria, e não uma `Mensagem` de tipo especial: o histórico de
+/// mensagens é lido pelo Agente IA e contado pelo Analytics, e evento de
+/// sistema não pode virar fala do contato para nenhum dos dois.
+enum ConversaEventoTipo {
+  ETIQUETA_ADICIONADA
+  ETIQUETA_REMOVIDA
+  ATRIBUIDA
+  TRANSFERIDA
+  ATRIBUICAO_REMOVIDA
+  FINALIZADA
+  REABERTA
+  AGENDAMENTO_CRIADO
+  KANBAN_CARTAO
+  AUTOMACAO_INICIADA
+  CAMPO_ALTERADO
+  MEMBRO_NOTIFICADO
+
+  @@map("conversa_evento_tipo")
+}
+
+model ConversaEvento {
+  id         String             @id @default(uuid()) @db.Uuid
+  tenantId   String             @db.Uuid
+  /// O evento é do CONTATO: aparece em qualquer conversa dele.
+  contatoId  String             @db.Uuid
+  conversaId String?            @db.Uuid
+  tipo       ConversaEventoTipo
+  /// Texto já pronto para exibir ("Etiqueta *Lead quente* adicionada por Ana").
+  descricao  String
+  /// `MANUAL` | `AUTOMACAO` | `SISTEMA`.
+  origem     String             @default("MANUAL")
+  /// Quem fez. Nulo quando foi a automação ou o próprio sistema.
+  usuarioId  String?            @db.Uuid
+  metadata   Json?
+  criadoEm   DateTime           @default(now()) @db.Timestamptz()
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contato  Contato   @relation(fields: [contatoId], references: [id], onDelete: Cascade)
+  conversa Conversa? @relation(fields: [conversaId], references: [id], onDelete: SetNull)
+  usuario  Usuario?  @relation(fields: [usuarioId], references: [id], onDelete: SetNull)
+
+  @@index([contatoId, criadoEm])
+  @@index([tenantId, criadoEm])
+  @@map("conversa_eventos")
+}
+
+// ---------------------------------------------------------------------------
+// Modelos de mensagem (templates da Meta)
+// ---------------------------------------------------------------------------
+
+/// Categoria do modelo, na linguagem do produto. `MARKETING_LITE` é um
+/// modelo de categoria MARKETING na Meta, enviado pela API de Marketing
+/// Messages Lite — a diferença é o canal de envio, não o modelo.
+enum TemplateCategoria {
+  MARKETING_LITE
+  MARKETING
+  UTILIDADE
+
+  @@map("template_categoria")
+}
+
+enum TemplateStatus {
+  /// Ainda não foi enviado para a Meta.
+  RASCUNHO
+  PENDENTE
+  APROVADO
+  REJEITADO
+  PAUSADO
+  DESATIVADO
+
+  @@map("template_status")
+}
+
+model MensagemTemplate {
+  id                   String @id @default(uuid()) @db.Uuid
+  tenantId             String @db.Uuid
+  whatsappConnectionId String @db.Uuid
+
+  /// Id do modelo na Meta — nulo enquanto é rascunho.
+  metaTemplateId String?           @unique
+  /// Nome na Meta: minúsculas, números e `_`.
+  nome           String
+  /// Código de idioma da Meta (`pt_BR`, `en_US`…).
+  idioma         String            @default("pt_BR")
+  categoria      TemplateCategoria
+  status         TemplateStatus    @default(RASCUNHO)
+
+  /// `{ tipo: 'TEXTO'|'IMAGEM'|'VIDEO'|'DOCUMENTO', texto?, exemploUrl?, exemploHandle? }`
+  cabecalho        Json?
+  /// Corpo com variáveis `{{1}}`, `{{2}}`…
+  corpo            String
+  /// Exemplos das variáveis do corpo, na ordem — a Meta exige para aprovar.
+  corpoExemplos    Json    @default("[]")
+  rodape           String?
+  /// `[{ tipo: 'RESPOSTA_RAPIDA'|'URL'|'TELEFONE', texto, url?, telefone? }]`
+  botoes           Json    @default("[]")
+  /// Período de validade da mensagem (`message_send_ttl_seconds`): passado
+  /// esse tempo sem conseguir entregar, a Meta desiste.
+  validadeSegundos Int?
+  motivoRejeicao   String?
+  /// `GREEN` | `YELLOW` | `RED` | `UNKNOWN`, como a Meta informa.
+  qualidade        String?
+
+  criadoEm       DateTime  @default(now()) @db.Timestamptz()
+  atualizadoEm   DateTime  @updatedAt @db.Timestamptz()
+  sincronizadoEm DateTime? @db.Timestamptz()
+
+  tenant             Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  whatsappConnection WhatsAppConnection @relation(fields: [whatsappConnectionId], references: [id], onDelete: Cascade)
+
+  @@unique([whatsappConnectionId, nome, idioma])
+  @@index([tenantId])
+  @@map("mensagem_templates")
+}
+
+// ---------------------------------------------------------------------------
+// Agenda
+// ---------------------------------------------------------------------------
+
+enum AgendamentoStatus {
+  CONFIRMADO
+  PENDENTE
+  CONCLUIDO
+  CANCELADO
+
+  @@map("agendamento_status")
+}
+
+model Agendamento {
+  id        String  @id @default(uuid()) @db.Uuid
+  tenantId  String  @db.Uuid
+  /// Membro responsável. Nulo só se o membro foi removido depois.
+  usuarioId String? @db.Uuid
+  contatoId String? @db.Uuid
+
+  titulo     String
+  descricao  String?
+  local      String?
+  link       String?
+  inicio     DateTime          @db.Timestamptz()
+  fim        DateTime          @db.Timestamptz()
+  diaInteiro Boolean           @default(false)
+  status     AgendamentoStatus @default(CONFIRMADO)
+  cor        String?
+
+  /// Avisar o responsável N minutos antes (notificação no sino).
+  lembreteMinutos   Int?
+  lembreteEnviadoEm DateTime? @db.Timestamptz()
+
+  /// `MANUAL` | `AUTOMACAO`.
+  origem      String  @default("MANUAL")
+  criadoPorId String? @db.Uuid
+
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  usuario   Usuario? @relation("AgendamentoResponsavel", fields: [usuarioId], references: [id], onDelete: SetNull)
+  criadoPor Usuario? @relation("AgendamentoCriador", fields: [criadoPorId], references: [id], onDelete: SetNull)
+  contato   Contato? @relation(fields: [contatoId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, inicio])
+  @@index([usuarioId, inicio])
+  @@index([contatoId])
+  /// O poller de lembretes varre "ainda não avisados, começando em breve".
+  @@index([lembreteEnviadoEm, inicio])
+  @@map("agendamentos")
+}
+
+// ---------------------------------------------------------------------------
+// Kanban
+// ---------------------------------------------------------------------------
+
+model KanbanQuadro {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @db.Uuid
+  nome         String
+  descricao    String?
+  cor          String?
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant  Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  colunas KanbanColuna[]
+  cartoes KanbanCartao[]
+
+  @@index([tenantId])
+  @@map("kanban_quadros")
+}
+
+model KanbanColuna {
+  id       String   @id @default(uuid()) @db.Uuid
+  quadroId String   @db.Uuid
+  nome     String
+  cor      String?
+  ordem    Int      @default(0)
+  criadoEm DateTime @default(now()) @db.Timestamptz()
+
+  quadro  KanbanQuadro   @relation(fields: [quadroId], references: [id], onDelete: Cascade)
+  cartoes KanbanCartao[]
+
+  @@index([quadroId, ordem])
+  @@map("kanban_colunas")
+}
+
+model KanbanCartao {
+  id        String    @id @default(uuid()) @db.Uuid
+  tenantId  String    @db.Uuid
+  quadroId  String    @db.Uuid
+  colunaId  String    @db.Uuid
+  contatoId String?   @db.Uuid
+  titulo    String
+  descricao String?
+  valor     Decimal?  @db.Decimal(12, 2)
+  prazo     DateTime? @db.Timestamptz()
+  /// Posição dentro da coluna. Float para inserir entre dois cartões sem
+  /// renumerar a coluna inteira a cada arrasto.
+  posicao   Float     @default(0)
+
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  quadro  KanbanQuadro         @relation(fields: [quadroId], references: [id], onDelete: Cascade)
+  coluna  KanbanColuna         @relation(fields: [colunaId], references: [id], onDelete: Cascade)
+  contato Contato?             @relation(fields: [contatoId], references: [id], onDelete: SetNull)
+  membros KanbanCartaoMembro[]
+
+  @@index([colunaId, posicao])
+  @@index([quadroId])
+  @@index([contatoId])
+  @@map("kanban_cartoes")
+}
+
+model KanbanCartaoMembro {
+  cartaoId  String @db.Uuid
+  usuarioId String @db.Uuid
+
+  cartao  KanbanCartao @relation(fields: [cartaoId], references: [id], onDelete: Cascade)
+  usuario Usuario      @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  @@id([cartaoId, usuarioId])
+  @@index([usuarioId])
+  @@map("kanban_cartao_membros")
 }
 
 // ---------------------------------------------------------------------------
@@ -531,6 +986,9 @@ model WorkflowExecutionWait {
   resolvedAt      DateTime? @db.Timestamptz()
   /// "TIMEOUT" | "REPLY"
   resolvedReason  String?
+  /// `false` no "Atraso inteligente": a espera é só de TEMPO, e uma mensagem
+  /// do contato no meio dela não pode adiantar o fluxo.
+  aceitaResposta  Boolean   @default(true)
   criadoEm        DateTime  @default(now()) @db.Timestamptz()
 
   execution WorkflowExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
@@ -795,8 +1253,8 @@ model Assinatura {
 
   /// Plano PAGO. `Tenant.plano` é espelho deste valor (é ele que os limites
   /// leem); aqui fica o registro de o que de fato foi cobrado.
-  plano  PlanoTipo        @default(STARTER)
-  status AssinaturaStatus @default(PENDENTE)
+  plano  PlanoTipo         @default(STARTER)
+  status AssinaturaStatus  @default(PENDENTE)
   origem AssinaturaOrigem?
 
   /// Até quando a plataforma responde para este tenant. `null` = nunca pagou.
@@ -878,7 +1336,7 @@ model MercadoPagoWebhookEvent {
   id String @id @default(uuid()) @db.Uuid
 
   /// `payment` | `subscription_preapproval` | `subscription_authorized_payment` …
-  tipo String
+  tipo            String
   /// Identidade da NOTIFICAÇÃO (o campo `id` do corpo), não do recurso: a
   /// Mercado Pago avisa sobre o mesmo pagamento várias vezes — uma quando ele
   /// nasce pendente, outra quando é aprovado — e cada aviso tem id próprio.
@@ -1027,7 +1485,7 @@ model AiCreditTransaction {
   saldoAntes  Int
   saldoDepois Int
 
-  descricao String
+  descricao    String
   /// O que originou a movimentação, conforme o tipo: id do `AiUsage`, do
   /// `AiCreditPurchase`, do pagamento na Mercado Pago, ou da concessão.
   referenciaId String?

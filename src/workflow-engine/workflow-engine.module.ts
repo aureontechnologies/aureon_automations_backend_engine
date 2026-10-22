@@ -13,6 +13,10 @@ import { WorkflowEngineService } from './engine.service';
 import { NodeExecutorRegistry } from './node-executor.registry';
 import { WaitResolverService } from './wait-resolver.service';
 import { WaitTimeoutPollerService } from './wait-timeout-poller.service';
+import { RunActionsHandler } from './handlers/run-actions.handler';
+import { ConditionHandler } from './handlers/condition.handler';
+import { SmartDelayHandler } from './handlers/smart-delay.handler';
+import { CrmActionsService } from '../crm/crm-actions.service';
 
 /**
  * Cada handler se registra no `NodeExecutorRegistry` no PRÓPRIO construtor —
@@ -39,6 +43,10 @@ import { WaitTimeoutPollerService } from './wait-timeout-poller.service';
     TriggerAiAgentHandler,
     IfContactRepliedHandler,
     RestartAutomationHandler,
+    CrmActionsService,
+    RunActionsHandler,
+    ConditionHandler,
+    SmartDelayHandler,
   ],
   exports: [WorkflowEngineService, WaitResolverService],
 })
