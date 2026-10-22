@@ -32,30 +32,35 @@ model Tenant {
   plano    PlanoTipo @default(STARTER)
   criadoEm DateTime  @default(now()) @db.Timestamptz()
 
-  usuarios             Usuario[]
-  whatsappConnections  WhatsAppConnection[]
-  instagramConnections InstagramConnection[]
-  facebookConnections  FacebookConnection[]
-  contatos             Contato[]
-  workflows            Workflow[]
-  webhookEvents        ChannelWebhookEvent[]
-  agentes              Agente[]
-  customWebhooks       CustomWebhook[]
-  mensagens            Mensagem[]
-  assinatura           Assinatura?
-  pagamentos           PagamentoMercadoPago[]
-  aiCreditWallet       AiCreditWallet?
-  aiCreditTransactions AiCreditTransaction[]
-  aiCreditPurchases    AiCreditPurchase[]
-  aiUsages             AiUsage[]
-  equipes              Equipe[]
-  etiquetas            Etiqueta[]
-  conversas            Conversa[]
-  conversaEventos      ConversaEvento[]
-  mensagemTemplates    MensagemTemplate[]
-  agendamentos         Agendamento[]
-  kanbanQuadros        KanbanQuadro[]
-  notificacoes         Notificacao[]
+  usuarios              Usuario[]
+  whatsappConnections   WhatsAppConnection[]
+  instagramConnections  InstagramConnection[]
+  facebookConnections   FacebookConnection[]
+  contatos              Contato[]
+  workflows             Workflow[]
+  webhookEvents         ChannelWebhookEvent[]
+  agentes               Agente[]
+  customWebhooks        CustomWebhook[]
+  mensagens             Mensagem[]
+  assinatura            Assinatura?
+  pagamentos            PagamentoMercadoPago[]
+  aiCreditWallet        AiCreditWallet?
+  aiCreditTransactions  AiCreditTransaction[]
+  aiCreditPurchases     AiCreditPurchase[]
+  aiUsages              AiUsage[]
+  equipes               Equipe[]
+  etiquetas             Etiqueta[]
+  conversas             Conversa[]
+  conversaEventos       ConversaEvento[]
+  mensagemTemplates     MensagemTemplate[]
+  agendamentos          Agendamento[]
+  kanbanQuadros         KanbanQuadro[]
+  notificacoes          Notificacao[]
+  workflowPastas        WorkflowPasta[]
+  campanhas             Campanha[]
+  campanhaVisitas       CampanhaVisita[]
+  campanhaParticipantes CampanhaParticipante[]
+  campanhaEventos       CampanhaEvento[]
 
   @@map("tenants")
 }
@@ -92,6 +97,11 @@ model Usuario {
   /// "Disponível para novos atendimentos" — entra no rodízio de atribuição.
   disponivelAtendimento Boolean      @default(true)
   cargo                 String?
+  /// Dados de perfil que o próprio usuário edita na tela "Meu perfil".
+  telefone              String?
+  /// Quando a foto de perfil mudou pela última vez — `null` = sem foto. Vira
+  /// o `?v=` da URL da foto, para o navegador não servir a antiga do cache.
+  fotoAtualizadaEm      DateTime?    @db.Timestamptz()
 
   tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   refreshTokens       RefreshToken[]
@@ -103,9 +113,23 @@ model Usuario {
   agendamentosCriados Agendamento[]        @relation("AgendamentoCriador")
   kanbanCartoes       KanbanCartaoMembro[]
   notificacoes        Notificacao[]
+  foto                UsuarioFoto?
 
   @@index([tenantId])
   @@map("usuarios")
+}
+
+/// Foto de perfil, já reduzida no cliente (até 512 px). Fica numa tabela à
+/// parte para que nenhuma consulta de `usuarios` carregue os bytes por acaso.
+model UsuarioFoto {
+  usuarioId    String   @id @db.Uuid
+  mimeType     String
+  conteudo     Bytes
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  usuario Usuario @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  @@map("usuario_fotos")
 }
 
 // ---------------------------------------------------------------------------
@@ -296,8 +320,21 @@ model Contato {
   rating       Int      @default(0)
   atualizadoEm DateTime @default(now()) @updatedAt @db.Timestamptz()
 
-  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  agenteAtivo        Agente?             @relation(fields: [agenteAtivoId], references: [id], onDelete: SetNull)
+  /// Atribuição de origem: a PRIMEIRA campanha pela qual o contato chegou
+  /// (nunca é sobrescrita) e a MAIS RECENTE. O histórico completo de entradas
+  /// fica em `campanha_eventos`; estes campos existem para o perfil e os
+  /// filtros não precisarem varrer o histórico.
+  campanhaOrigemId String?   @db.Uuid
+  campanhaOrigemEm DateTime? @db.Timestamptz()
+  campanhaUltimaId String?   @db.Uuid
+  campanhaUltimaEm DateTime? @db.Timestamptz()
+
+  tenant             Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campanhaOrigem     Campanha?              @relation("ContatoCampanhaOrigem", fields: [campanhaOrigemId], references: [id], onDelete: SetNull)
+  campanhaUltima     Campanha?              @relation("ContatoCampanhaUltima", fields: [campanhaUltimaId], references: [id], onDelete: SetNull)
+  campanhas          CampanhaParticipante[]
+  campanhaEventos    CampanhaEvento[]
+  agenteAtivo        Agente?                @relation(fields: [agenteAtivoId], references: [id], onDelete: SetNull)
   conversas          Conversa[]
   workflowExecutions WorkflowExecution[]
   mensagens          Mensagem[]
@@ -310,6 +347,8 @@ model Contato {
   @@index([tenantId])
   @@index([agenteAtivoId])
   @@index([tenantId, criadoEm])
+  @@index([campanhaOrigemId])
+  @@index([campanhaUltimaId])
   @@map("contatos")
 }
 
@@ -788,16 +827,22 @@ model Workflow {
   instagramConnectionId String? @db.Uuid
   facebookConnectionId  String? @db.Uuid
 
+  /// Pasta ("conjunto de fluxos") em que o workflow está. `null` = solto na
+  /// raiz. Apagar a pasta devolve os fluxos para a raiz, nunca os apaga.
+  pastaId String? @db.Uuid
+
   criadoEm     DateTime @default(now()) @db.Timestamptz()
   atualizadoEm DateTime @updatedAt @db.Timestamptz()
 
   tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  pasta               WorkflowPasta?       @relation(fields: [pastaId], references: [id], onDelete: SetNull)
   whatsappConnection  WhatsAppConnection?  @relation(fields: [whatsappConnectionId], references: [id], onDelete: SetNull)
   instagramConnection InstagramConnection? @relation(fields: [instagramConnectionId], references: [id], onDelete: SetNull)
   facebookConnection  FacebookConnection?  @relation(fields: [facebookConnectionId], references: [id], onDelete: SetNull)
   nodes               WorkflowNode[]
   edges               WorkflowEdge[]
   executions          WorkflowExecution[]
+  campanhas           Campanha[]
 
   @@index([tenantId])
   /// Chave do roteamento: "qual automação ATIVA responde por esta conexão".
@@ -806,7 +851,24 @@ model Workflow {
   @@index([whatsappConnectionId, status])
   @@index([instagramConnectionId, status])
   @@index([facebookConnectionId, status])
+  @@index([tenantId, pastaId])
   @@map("workflows")
+}
+
+/// Conjunto de fluxos — o primeiro nível da tela de Workflows (como as pastas
+/// do BotConversa). Um nível só: pasta não contém pasta.
+model WorkflowPasta {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @db.Uuid
+  nome         String
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  workflows Workflow[]
+
+  @@unique([tenantId, nome])
+  @@map("workflow_pastas")
 }
 
 model WorkflowNode {
@@ -995,6 +1057,162 @@ model WorkflowExecutionWait {
 
   @@index([resumeAt])
   @@map("workflow_execution_waits")
+}
+
+// ---------------------------------------------------------------------------
+// Campanhas de entrada (links rastreáveis + QR Code para o WhatsApp)
+//
+// Domínio do WhatsApp: o link abre `wa.me` no número da automação vinculada.
+// Quatro tabelas, cada uma com UM tipo de fato — visitas (alguém abriu o
+// link), participantes (contato identificado), eventos (o histórico) — para
+// que nenhuma métrica seja estimada a partir de outra.
+// ---------------------------------------------------------------------------
+
+enum CampanhaStatus {
+  ATIVA
+  /// Pausada: o link mostra "indisponível" e a frase não aciona o fluxo. Os
+  /// dados históricos continuam intactos.
+  INATIVA
+
+  @@map("campanha_status")
+}
+
+model Campanha {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+
+  nome        String
+  /// Frase pré-preenchida no WhatsApp, como o usuário digitou (sem espaços
+  /// sobrando) — é o texto que vai no link.
+  fraseInicio String
+  /// `fraseInicio` normalizada (minúsculas, sem acento, espaços colapsados) —
+  /// a chave pela qual a mensagem recebida reencontra a campanha. Única por
+  /// tenant para que uma mensagem nunca seja de duas campanhas. Nula quando a
+  /// campanha é arquivada, liberando a frase (o Postgres aceita vários NULL).
+  fraseChave  String?
+  /// Identificador PÚBLICO e estável (`/c/<slug>`). Gerado na criação e nunca
+  /// muda: o QR Code impresso continua válido depois de qualquer edição.
+  slug        String         @unique
+  status      CampanhaStatus @default(ATIVA)
+  /// Nulo se a automação for apagada — a campanha e seu histórico ficam.
+  workflowId  String?        @db.Uuid
+  /// Exclusão lógica: some da listagem, preserva relatórios e a origem dos
+  /// contatos.
+  arquivadaEm DateTime?      @db.Timestamptz()
+  criadoPorId String?        @db.Uuid
+
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant         Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  workflow       Workflow?              @relation(fields: [workflowId], references: [id], onDelete: SetNull)
+  visitas        CampanhaVisita[]
+  participantes  CampanhaParticipante[]
+  eventos        CampanhaEvento[]
+  contatosOrigem Contato[]              @relation("ContatoCampanhaOrigem")
+  contatosUltima Contato[]              @relation("ContatoCampanhaUltima")
+
+  @@unique([tenantId, fraseChave])
+  @@index([tenantId, status])
+  @@index([tenantId, criadoEm])
+  @@index([workflowId])
+  @@map("campanhas")
+}
+
+/// Um acesso ao link `/c/<slug>`. Abrir o link NÃO é participar: o contato só
+/// existe quando a mensagem chega. Bots de pré-visualização não entram aqui.
+model CampanhaVisita {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @db.Uuid
+  campanhaId    String   @db.Uuid
+  /// HMAC de IP + navegador + campanha. Nunca guardamos o IP em claro; o hash
+  /// só serve para contar visitantes únicos e ignorar recarregamentos.
+  visitanteHash String
+  /// Janela de 30 min (época ÷ 30 min) em que a visita caiu. Junto com o hash
+  /// é a trava única que ignora recarregamentos — atômica, sem corrida entre
+  /// dois acessos simultâneos.
+  janela        Int      @default(0)
+  criadoEm      DateTime @default(now()) @db.Timestamptz()
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campanha Campanha @relation(fields: [campanhaId], references: [id], onDelete: Cascade)
+
+  @@unique([campanhaId, visitanteHash, janela])
+  @@index([campanhaId, criadoEm])
+  @@index([tenantId, criadoEm])
+  @@map("campanha_visitas")
+}
+
+/// Contato identificado como vindo da campanha — um por (campanha, contato).
+model CampanhaParticipante {
+  id         String @id @default(uuid()) @db.Uuid
+  tenantId   String @db.Uuid
+  campanhaId String @db.Uuid
+  contatoId  String @db.Uuid
+
+  primeiraEntradaEm DateTime @db.Timestamptz()
+  ultimaEntradaEm   DateTime @db.Timestamptz()
+  /// Quantas vezes o contato mandou a frase da campanha.
+  entradas          Int      @default(1)
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campanha Campanha @relation(fields: [campanhaId], references: [id], onDelete: Cascade)
+  contato  Contato  @relation(fields: [contatoId], references: [id], onDelete: Cascade)
+
+  @@unique([campanhaId, contatoId])
+  @@index([campanhaId, primeiraEntradaEm])
+  @@index([tenantId, primeiraEntradaEm])
+  @@index([contatoId])
+  @@map("campanha_participantes")
+}
+
+enum CampanhaEventoTipo {
+  /// O contato mandou a frase da campanha (toda vez, inclusive repetidas).
+  ENTRADA
+  /// O fluxo da campanha foi efetivamente iniciado (execução reservada e
+  /// entregue ao motor).
+  EXECUCAO_INICIADA
+  /// A entrada foi reconhecida, mas o fluxo não foi iniciado — `motivo` diz por quê.
+  EXECUCAO_NAO_INICIADA
+  CRIADA
+  EDITADA
+  ATIVADA
+  DESATIVADA
+  ARQUIVADA
+
+  @@map("campanha_evento_tipo")
+}
+
+/// Histórico da campanha. É daqui que saem as execuções (e não de
+/// `workflow_executions`, que não sabe de campanha nenhuma).
+model CampanhaEvento {
+  id                  String             @id @default(uuid()) @db.Uuid
+  tenantId            String             @db.Uuid
+  campanhaId          String             @db.Uuid
+  contatoId           String?            @db.Uuid
+  tipo                CampanhaEventoTipo
+  /// `wamid` da mensagem que gerou o evento — junto com a campanha e o tipo, é
+  /// a trava de idempotência contra reentrega do webhook/fila.
+  messageId           String?
+  workflowExecutionId String?            @db.Uuid
+  /// Código do motivo em `EXECUCAO_NAO_INICIADA` (`AGENTE_IA_ATIVO`, …).
+  motivo              String?
+  descricao           String
+  /// Quem fez, nos eventos manuais (criar, editar…). Nulo nos automáticos.
+  usuarioId           String?            @db.Uuid
+  metadata            Json?
+  criadoEm            DateTime           @default(now()) @db.Timestamptz()
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campanha Campanha @relation(fields: [campanhaId], references: [id], onDelete: Cascade)
+  contato  Contato? @relation(fields: [contatoId], references: [id], onDelete: SetNull)
+
+  @@unique([campanhaId, tipo, messageId])
+  @@index([campanhaId, criadoEm])
+  @@index([campanhaId, tipo, criadoEm])
+  @@index([tenantId, tipo, criadoEm])
+  @@index([contatoId])
+  @@map("campanha_eventos")
 }
 
 // ---------------------------------------------------------------------------
