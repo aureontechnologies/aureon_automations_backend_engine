@@ -455,14 +455,20 @@ export class WorkflowEngineService {
       resolvedAt: null,
       resolvedReason: null,
     };
+    // `criadoEm` marca quando ESTA espera começou — não a primeira da execução.
+    // É por ele que a resposta do contato escolhe qual espera resolver
+    // (`claimByContato`); manter a data da primeira espera fazia uma execução
+    // antiga, ainda parada num botão, roubar a resposta destinada ao
+    // "Aguardar resposta" de outra — que então seguia por "não respondeu".
+    const agora = new Date();
     // Uma execução tem no máximo UMA espera pendente (`executionId` é único),
     // mas passa por várias ao longo do fluxo — "Mensagem com Botões" e depois
     // "Aguardar Resposta", por exemplo. Por isso a linha é reaproveitada:
     // criar uma segunda quebraria a execução no meio do caminho.
     await this.prisma.workflowExecutionWait.upsert({
       where: { executionId },
-      create: { executionId, ...data },
-      update: data,
+      create: { executionId, ...data, criadoEm: agora },
+      update: { ...data, criadoEm: agora },
     });
   }
 

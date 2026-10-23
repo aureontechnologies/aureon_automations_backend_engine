@@ -61,6 +61,9 @@ model Tenant {
   campanhaVisitas       CampanhaVisita[]
   campanhaParticipantes CampanhaParticipante[]
   campanhaEventos       CampanhaEvento[]
+  transmissoes          Transmissao[]
+  transmissaoDestinos   TransmissaoDestinatario[]
+  transmissaoEventos    TransmissaoEvento[]
 
   @@map("tenants")
 }
@@ -243,6 +246,7 @@ model WhatsAppConnection {
   conversas         Conversa[]
   workflows         Workflow[]
   mensagemTemplates MensagemTemplate[]
+  transmissoes      Transmissao[]
 
   /// phoneNumberId da Meta é globalmente único — impede que um número
   /// migrado entre tenants sem limpeza cause roteamento cruzado de webhooks.
@@ -329,6 +333,21 @@ model Contato {
   campanhaUltimaId String?   @db.Uuid
   campanhaUltimaEm DateTime? @db.Timestamptz()
 
+  /// Consentimento para MARKETING (transmissões). Ter o telefone NÃO é
+  /// consentimento: o contato só recebe transmissão com opt-in registrado e
+  /// sem opt-out. Origem e evidência ficam para auditoria (de onde veio o
+  /// "sim": formulário, conversa, importação…). Um opt-in novo limpa o opt-out
+  /// e o bloqueio — é o contato dizendo "sim" de novo.
+  marketingOptInEm        DateTime? @db.Timestamptz()
+  marketingOptInOrigem    String?
+  marketingOptInEvidencia String?
+  marketingOptOutEm       DateTime? @db.Timestamptz()
+  marketingOptOutOrigem   String?
+  /// Bloqueio conhecido, vindo da própria Meta (número sem WhatsApp, contato
+  /// que bloqueou a empresa…). Também exclui o contato das transmissões.
+  marketingBloqueadoEm    DateTime? @db.Timestamptz()
+  marketingBloqueioMotivo String?
+
   tenant             Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   campanhaOrigem     Campanha?              @relation("ContatoCampanhaOrigem", fields: [campanhaOrigemId], references: [id], onDelete: SetNull)
   campanhaUltima     Campanha?              @relation("ContatoCampanhaUltima", fields: [campanhaUltimaId], references: [id], onDelete: SetNull)
@@ -342,6 +361,7 @@ model Contato {
   eventos            ConversaEvento[]
   agendamentos       Agendamento[]
   kanbanCartoes      KanbanCartao[]
+  transmissoes       TransmissaoDestinatario[]
 
   @@unique([tenantId, telefone])
   @@index([tenantId])
@@ -843,6 +863,7 @@ model Workflow {
   edges               WorkflowEdge[]
   executions          WorkflowExecution[]
   campanhas           Campanha[]
+  transmissoes        Transmissao[]
 
   @@index([tenantId])
   /// Chave do roteamento: "qual automação ATIVA responde por esta conexão".
@@ -983,6 +1004,11 @@ model WorkflowExecution {
   workflowVersion Int                     @default(1)
   currentNodeId   String?                 @db.Uuid
   status          WorkflowExecutionStatus @default(RUNNING)
+  /// De onde a execução veio. Vazio = gatilho de mensagem (a regra "uma vez
+  /// por versão" de sempre). Uma transmissão usa `transmissao:<destinatário>`:
+  /// cada envio é uma execução própria, e a retentativa do MESMO envio
+  /// reencontra a mesma linha em vez de abrir um segundo fluxo.
+  origemChave     String                  @default("")
 
   iniciadoEm   DateTime  @default(now()) @db.Timestamptz()
   finalizadoEm DateTime? @db.Timestamptz()
@@ -992,7 +1018,7 @@ model WorkflowExecution {
   nodes    WorkflowExecutionNode[]
   wait     WorkflowExecutionWait?
 
-  @@unique([workflowId, contatoId, workflowVersion])
+  @@unique([workflowId, contatoId, workflowVersion, origemChave])
   @@index([workflowId])
   /// O painel de Analytics sempre lê por workflow E por janela de tempo (a
   /// tabela não tem `tenantId`, então o escopo vem do JOIN com `workflows`).
@@ -1213,6 +1239,185 @@ model CampanhaEvento {
   @@index([tenantId, tipo, criadoEm])
   @@index([contatoId])
   @@map("campanha_eventos")
+}
+
+// ---------------------------------------------------------------------------
+// Transmissões (envio de marketing para contatos existentes)
+//
+// Uma transmissão manda o MODELO de marketing aprovado com que o fluxo começa
+// para cada destinatário, e entrega o resto do fluxo ao motor. A criação
+// (HTTP) e o envio (fila) são separados: a requisição só grava a intenção; a
+// fila manda uma mensagem por destinatário, com trava de idempotência por
+// linha de `transmissao_destinatarios`.
+// ---------------------------------------------------------------------------
+
+enum TransmissaoStatus {
+  RASCUNHO
+  /// Data marcada; o agendador do backend inicia sozinho, com ou sem navegador aberto.
+  AGENDADA
+  /// Reivindicada para começar: revalidando fluxo/modelo e montando a audiência.
+  PREPARANDO
+  EM_ANDAMENTO
+  /// Pediram para cancelar no meio: nada novo sai; os envios em voo terminam.
+  CANCELANDO
+  CONCLUIDA
+  /// Terminou, mas parte dos destinatários falhou.
+  CONCLUIDA_COM_FALHAS
+  CANCELADA
+  /// Não chegou a enviar (fluxo/modelo inelegível) ou foi interrompida por um
+  /// erro que vale para todos (modelo pausado pela Meta, token inválido…).
+  FALHOU
+
+  @@map("transmissao_status")
+}
+
+/// Estado de UM envio. `SENT` = a Meta aceitou; `DELIVERED`/`READ` só vêm
+/// dos webhooks — aceitar não é entregar.
+enum TransmissaoEnvioStatus {
+  PENDING
+  PROCESSING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  /// Não entrou no envio (sem consentimento, opt-out, variável vazia…) — `motivo` diz por quê.
+  SKIPPED
+  CANCELLED
+
+  @@map("transmissao_envio_status")
+}
+
+model Transmissao {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+
+  nome                 String
+  status               TransmissaoStatus @default(RASCUNHO)
+  /// Nulos se o número ou o fluxo forem removidos — o histórico fica, e o
+  /// `snapshot` guarda o que foi usado.
+  whatsappConnectionId String?           @db.Uuid
+  workflowId           String?           @db.Uuid
+
+  /// `{ combinacao: 'E'|'OU', filtros: [{ campo, operador, valor }] }` — ver `segmentacao.ts`.
+  segmentacao      Json   @default("{\"combinacao\":\"E\",\"filtros\":[]}")
+  /// `SEGMENTO` (só filtros) | `MANUAL` (só os escolhidos) | `SEGMENTO_E_MANUAL` (a união dos dois).
+  modoAudiencia    String @default("SEGMENTO")
+  /// Ids dos contatos escolhidos à mão.
+  contatoIds       Json   @default("[]")
+  /// Variável obrigatória sem valor para um contato: `EXCLUIR` o contato ou `BLOQUEAR` a transmissão.
+  politicaVariavel String @default("EXCLUIR")
+
+  /// Instante (UTC) em que deve começar. Nulo = "disparar agora".
+  agendadaPara DateTime? @db.Timestamptz()
+  /// Fuso em que o usuário escolheu o horário — só para exibir de volta.
+  fusoHorario  String?
+
+  /// O que foi efetivamente usado ao começar (nome do fluxo, versão, modelo,
+  /// nó do modelo…). Preserva a auditoria mesmo se o fluxo for editado depois.
+  snapshot Json?
+
+  totalDestinatarios Int @default(0)
+  totalExcluidos     Int @default(0)
+
+  iniciadaEm       DateTime? @db.Timestamptz()
+  concluidaEm      DateTime? @db.Timestamptz()
+  canceladaEm      DateTime? @db.Timestamptz()
+  motivoFalha      String?
+  /// Tentativas de começar que esbarraram em erro temporário (Meta fora do ar).
+  tentativasInicio Int       @default(0)
+
+  duplicadaDeId String? @db.Uuid
+  criadoPorId   String? @db.Uuid
+
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant             Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  whatsappConnection WhatsAppConnection?       @relation(fields: [whatsappConnectionId], references: [id], onDelete: SetNull)
+  workflow           Workflow?                 @relation(fields: [workflowId], references: [id], onDelete: SetNull)
+  destinatarios      TransmissaoDestinatario[]
+  eventos            TransmissaoEvento[]
+
+  @@index([tenantId, status, criadoEm])
+  /// O agendador varre "agendadas que já venceram".
+  @@index([status, agendadaPara])
+  @@map("transmissoes")
+}
+
+model TransmissaoDestinatario {
+  id            String  @id @default(uuid()) @db.Uuid
+  tenantId      String  @db.Uuid
+  transmissaoId String  @db.Uuid
+  /// Nulo se o contato for apagado depois — a linha fica para o histórico.
+  contatoId     String? @db.Uuid
+
+  /// Telefone normalizado (só dígitos, com DDI) e nome no momento do envio.
+  telefone String
+  nome     String?
+
+  status       TransmissaoEnvioStatus @default(PENDING)
+  /// Código do motivo de SKIPPED/FAILED/CANCELLED (`SEM_CONSENTIMENTO`, `TELEFONE_INVALIDO`…).
+  motivo       String?
+  erroMensagem String?
+  /// Código do erro devolvido pela Meta, quando houve.
+  erroCodigo   String?
+  tentativas   Int                    @default(0)
+  /// Valores das variáveis do modelo efetivamente enviados.
+  variaveis    Json?
+
+  /// Id da mensagem na Meta — é por ele (ou pelo `biz_opaque_callback_data`)
+  /// que os webhooks de entregue/lida/falhou encontram esta linha.
+  wamid               String?   @unique
+  workflowExecutionId String?   @db.Uuid
+  /// Falha ao iniciar o restante do fluxo depois do modelo enviado.
+  fluxoErro           String?
+
+  publicadoEm      DateTime? @db.Timestamptz()
+  processandoDesde DateTime? @db.Timestamptz()
+  enviadoEm        DateTime? @db.Timestamptz()
+  entregueEm       DateTime? @db.Timestamptz()
+  lidoEm           DateTime? @db.Timestamptz()
+  finalizadoEm     DateTime? @db.Timestamptz()
+
+  criadoEm     DateTime @default(now()) @db.Timestamptz()
+  atualizadoEm DateTime @updatedAt @db.Timestamptz()
+
+  tenant      Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  transmissao Transmissao @relation(fields: [transmissaoId], references: [id], onDelete: Cascade)
+  contato     Contato?    @relation(fields: [contatoId], references: [id], onDelete: SetNull)
+
+  /// Um contato entra uma vez por transmissão. A deduplicação por TELEFONE
+  /// (dois cadastros do mesmo número) é feita antes, na montagem da
+  /// audiência — ver `motivoDeExclusao`.
+  @@unique([transmissaoId, contatoId])
+  @@index([transmissaoId, telefone])
+  @@index([transmissaoId, status])
+  @@index([contatoId])
+  /// Recuperação: envios presos em PROCESSING / PENDING sem publicação.
+  @@index([status, processandoDesde])
+  @@index([tenantId])
+  @@map("transmissao_destinatarios")
+}
+
+/// Trilha de auditoria: criada, agendada, iniciada, cancelada, tentativa
+/// que falhou… `destinatarioId` preenchido nos eventos de um envio.
+model TransmissaoEvento {
+  id             String   @id @default(uuid()) @db.Uuid
+  tenantId       String   @db.Uuid
+  transmissaoId  String   @db.Uuid
+  destinatarioId String?  @db.Uuid
+  tipo           String
+  descricao      String
+  usuarioId      String?  @db.Uuid
+  metadata       Json?
+  criadoEm       DateTime @default(now()) @db.Timestamptz()
+
+  tenant      Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  transmissao Transmissao @relation(fields: [transmissaoId], references: [id], onDelete: Cascade)
+
+  @@index([transmissaoId, criadoEm])
+  @@index([destinatarioId])
+  @@map("transmissao_eventos")
 }
 
 // ---------------------------------------------------------------------------

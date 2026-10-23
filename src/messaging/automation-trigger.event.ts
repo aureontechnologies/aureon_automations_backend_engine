@@ -30,4 +30,10 @@ export interface AutomationTriggerEvent {
   reacao?: InboundReaction;
   respostaA?: InboundReplyContext;
   occurredAt: string;
+  /**
+   * Presente quando quem iniciou o fluxo foi uma TRANSMISSÃO, não uma mensagem
+   * do contato: o modelo inicial já foi enviado e o nó dele já está reivindicado.
+   */
+  origem?: 'TRANSMISSAO';
+  transmissaoId?: string;
 }

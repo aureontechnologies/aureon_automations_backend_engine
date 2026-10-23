@@ -249,10 +249,12 @@ export class CrmActionsService {
 
     const anterior = await this.prisma.workflowExecution.findUnique({
       where: {
-        workflowId_contatoId_workflowVersion: {
+        workflowId_contatoId_workflowVersion_origemChave: {
           workflowId: destino.id,
           contatoId: ctx.contatoId,
           workflowVersion: destino.version,
+          // Enquadramento é a mesma família dos gatilhos: "uma vez por versão".
+          origemChave: '',
         },
       },
       select: { id: true, status: true },

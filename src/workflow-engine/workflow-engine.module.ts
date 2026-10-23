@@ -7,6 +7,7 @@ import { RestartAutomationHandler } from './handlers/restart-automation.handler'
 import { SendButtonsMessageHandler } from './handlers/send-buttons-message.handler';
 import { SendMediaMessageHandler } from './handlers/send-media-message.handler';
 import { SendTextMessageHandler } from './handlers/send-text-message.handler';
+import { SendTemplateMessageHandler } from './handlers/send-template-message.handler';
 import { TriggerAiAgentHandler } from './handlers/trigger-ai-agent.handler';
 import { WaitForReplyHandler } from './handlers/wait-for-reply.handler';
 import { WorkflowEngineService } from './engine.service';
@@ -37,6 +38,7 @@ import { CrmActionsService } from '../crm/crm-actions.service';
     WaitTimeoutPollerService,
     EngineTriggersConsumer,
     SendTextMessageHandler,
+    SendTemplateMessageHandler,
     SendButtonsMessageHandler,
     SendMediaMessageHandler,
     WaitForReplyHandler,
